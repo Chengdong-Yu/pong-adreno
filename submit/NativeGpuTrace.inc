@@ -27,20 +27,26 @@ extern "C" int native_gpu_trace_enabled(void) {return __atomic_load_n(&gpuTraceO
 extern "C" void native_gpu_trace_record(uint32_t event,uint32_t pid,const uint64_t *values,uint32_t count)
 {
     if(!native_gpu_trace_enabled() || count>12 || (count && !values))return;
+    // Match the upstream latency capture policy. Per-texture, per-IB and
+    // runtime stages stay in the render server file, not in the kernel ring.
+    switch(event) {
+    case 1:case 3:case 10:case 11:case 20:case 21:case 22:case 23:case 65:case 69:break;
+    default:return;
+    }
     NativeGpuTraceRecord record{};uint64_t ns=0;
     absolutetime_to_nanoseconds(mach_absolute_time(),&ns);
     record.us=ns/1000;record.event=event;record.pid=pid;
     for(uint32_t i=0;i<count;++i)record.value[i]=values[i];
     record.sequence=gpuTrace.push(record);
-    const bool meta=event<=3 || event==GpuTraceImport || event==46 || event==47 || event==48 || event==56 || event==57 || event==58 || event==59;
+    const bool meta=event<=3 || event==65 || event==69;
     uint32_t free=0;
     if(meta && gpuMetadata && __atomic_compare_exchange_n(&gpuMetadataBusy,&free,1,false,__ATOMIC_ACQUIRE,__ATOMIC_RELAXED)) {
         unsigned pick=NativeGpuTraceMetadata;
         for(unsigned i=0;i<NativeGpuTraceMetadata;++i) {
             auto &m=gpuMetadata[i];
             if(!m.event && pick==NativeGpuTraceMetadata)pick=i;
-            if(m.event==event && m.pid==pid && (event!=GpuTraceImport || m.value[3]==record.value[3]) &&
-               ((event!=56 && event!=57) || (m.value[0]==record.value[0] && m.value[1]==record.value[1] && m.value[2]==record.value[2]))){pick=i;break;}
+            if(m.event==event && m.pid==pid && (event!=65 || m.value[0]==record.value[0]) &&
+               (event!=69 || m.value[1]==record.value[1])){pick=i;break;}
         }
         if(pick<NativeGpuTraceMetadata) {
             if(event==GpuTraceImport && record.value[0]==0)gpuMetadata[pick]={};

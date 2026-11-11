@@ -17,7 +17,7 @@ IOLock *scanout_gate;
 IOMemoryDescriptor *scanout;
 task_t client;
 PongScanoutModeInfo mode{};
-bool waiting=false,workerReady=false,poisoned=false,idleNotify=false;
+bool waiting=false,workerReady=false,poisoned=false,idleNotify=false,copyTimedOut=false;
 uint64_t sequence=0,completed=0,sourceUse=0;
 uint32_t nextSource=1;
 struct Source {IOMemoryDescriptor *owner=nullptr,*memory=nullptr;IOMemoryMap *map=nullptr;
@@ -103,7 +103,25 @@ extern "C" IOMemoryDescriptor *pong_scanout_memory(task_t owner)
 extern "C" bool pong_scanout_quarantined(void)
 {
     if(!scanout_gate)return false;
-    IOLockLock(scanout_gate);bool blocked=poisoned;IOLockUnlock(scanout_gate);return blocked;
+    IOLockLock(scanout_gate);bool blocked=poisoned || (copyTimedOut && pending.offered && !pending.done);IOLockUnlock(scanout_gate);return blocked;
+}
+// The immutable firmware allocation is retained for the whole boot. A
+// privileged observer may read it without replacing the real presenter,
+// dropping source mappings, changing DMA ownership or claiming a fence.
+extern "C" IOMemoryDescriptor *pong_scanout_diagnostic_memory(void)
+{
+    if(!scanout_gate)return nullptr;
+    IOLockLock(scanout_gate);
+    auto *memory=scanout;
+    if(memory)memory->retain();
+    IOLockUnlock(scanout_gate);return memory;
+}
+extern "C" IOReturn pong_scanout_diagnostic_mode(PongScanoutModeInfo *out)
+{
+    if(!out)return kIOReturnBadArgument;
+    if(!scanout_gate)return kIOReturnNotReady;
+    IOLockLock(scanout_gate);*out=mode;IOLockUnlock(scanout_gate);
+    return kIOReturnSuccess;
 }
 extern "C" void pong_scanout_idle(void)
 {
@@ -140,6 +158,15 @@ extern "C" IOReturn pong_scanout_call(task_t owner,unsigned op,const void *in,si
         pending.status=q.status;pending.done=true;
         if(q.status==PongScanoutNotSubmitted)workerReady=false;
         if(q.status && q.status!=PongScanoutNotSubmitted)poisoned=true;
+        if(copyTimedOut && !poisoned) {
+            // A scheduling deadline is not a failed fence. Only this real
+            // matching completion (or explicit never-submitted reply) ends
+            // quarantine. No source or scanout mapping was released meanwhile.
+            note(q.status?"delayed offer not submitted; resume CPU eligibility":
+                "delayed GPU fence actually completed; resume presentation",pending.id,q.status);
+            if(!q.status)completed++;
+            pending={};copyTimedOut=false;workerReady=false;
+        }
         IOLockWakeup(scanout_gate,&pending,false);IOLockUnlock(scanout_gate);return kIOReturnSuccess;
     }
     if(op!=PongScanoutWait || !in || inBytes!=sizeof(PongScanoutWaitInfo) || !out || outBytes!=sizeof(PongScanoutFrame)) {
@@ -177,7 +204,12 @@ extern "C" int pong_scanout_frame(IOMemoryDescriptor *source,size_t offset,uint3
     if(!scanout_gate || !source || stride<uint64_t(width)*4 || width!=mode.width || height!=mode.height || (offset&4095))return 0;
     IOLockLock(scanout_gate);
     if(poisoned){IOLockUnlock(scanout_gate);return 2;}
-    if(!client || !workerReady || pending.offered){IOLockUnlock(scanout_gate);return 0;}
+    if(pending.offered) {
+        // Even an undelivered offer can be taken by the presenter after
+        // this call returns. Keep CPU writes out until it is resolved.
+        IOLockUnlock(scanout_gate);return 2;
+    }
+    if(!client || !workerReady){IOLockUnlock(scanout_gate);return 0;}
     size_t bytes=(size_t(stride)*height+4095)&~size_t(4095);
     if(offset>source->getLength() || bytes>source->getLength()-offset){IOLockUnlock(scanout_gate);return 0;}
     // Retain the compositor's bounded surface pool across frames. Mapping a
@@ -201,8 +233,13 @@ extern "C" int pong_scanout_frame(IOMemoryDescriptor *source,size_t offset,uint3
     IOLockWakeup(scanout_gate,&pending,false);const uint64_t until=deadline(2000);
     while(!pending.done && !poisoned)
         if(IOLockSleepDeadline(scanout_gate,&pending,until,THREAD_UNINT)!=THREAD_AWAKENED)break;
-    if(pending.delivered && (!pending.done || (pending.status && pending.status!=PongScanoutNotSubmitted))) {
-        poisoned=true;note("GPU copy not retired; retain pages and previous frame",pending.id,pending.status?:kIOReturnTimeout);
+    if(pending.delivered && !pending.done) {
+        copyTimedOut=true;workerReady=false;
+        note("GPU scheduling deadline; retain pages pending real completion",pending.id,kIOReturnTimeout);
+        IOLockUnlock(scanout_gate);return 2;
+    }
+    if(pending.delivered && pending.status && pending.status!=PongScanoutNotSubmitted) {
+        poisoned=true;note("GPU copy failed; retain DMA ownership",pending.id,pending.status);
         IOLockUnlock(scanout_gate);return 2;
     }
     if(!pending.delivered)workerReady=false; // a vanished waiter cannot stall every subsequent CPU frame

@@ -1,22 +1,11 @@
-# PongAdreno
+# Pong / SM8475 Adreno 730 bring-up
 
-Adreno 730 平台支持：GMU、CP、HFI、ZAP 认证、SMMU 与 scanout，冷启动按原厂顺序进行。
-
-## 适配硬件
-
-- SM8475 的 Adreno 730（Cape GPUCC）：两路 LUCID_OLE PLL 配置，GPU SMMU 为 QSMMU V500（ACTLR `0x32b`）
-- GPU 中断 SPI300 / GIC INTID332；SID 0/1 与 mask `0x400` 的 user 与 lpac 上下文
-- `pong_adreno_start=1` 才发起一次异步冷启动；否则不碰 GPU MMIO
-
-## 仓库关系
-
-Pong 专属实现，不来自 `UniXNU/Adreno740`（那是 740 的固件与寄存器）。`ArmSmmu4K/` 供 Wi-Fi 与音频共用，`submit/` 是 NativeAdreno 的 Mesa/Turnip 侧。
-
-## 说明
-
-- `PongAdrenoCpProfile.h` 由 NothingOSS SM8475 gen7 源码生成，是 GPL-2.0-only；其余多为 BSD-2-Clause-Patent 与 MIT，逐文件 SPDX 标注。
-
-构建、接口与组件目录见 [UniXNU 组件目录](https://unixnu.com/reference/components)，板级输入与编译入口在 [UniXNU-pong](https://github.com/Chengdong-Yu/UniXNU-pong)。
+This is SM8475 platform support with an **optional cold GMU/CP startup attempt**.
+The native BO client is registered only after real authenticated CP fences.
+The optional20G81 Metal entry and framebuffer handoff require real CP fences;
+runtime GPU rendering has not yet been confirmed. `CONFIG_XNU_PONG_ADRENO_PLATFORM=y` links the implementation;
+`pong_adreno_start=1` explicitly requests one asynchronous startup attempt.
+Absent that argument, this entry performs no GPU MMIO.
 
 ## Sheng activation chain / Pong20G81
 
@@ -97,9 +86,7 @@ actual CP/Metal/scanout results must come from the next device log.
   original firmware structure planner and the basis of the isolated HFI fork.
 - UniXNU-Sheng/package/ShengGmu.c: startup structure and one-shot failure
   policy. No A740 register map, firmware hash or clock/voltage votes were copied.
-- Earlier port redwood_adreno.c: separation of platform power,
-  native4K GMU/GPU mappings, ZAP authentication, CP start and user-client
-  publication. Its A642L register/firmware values are not applicable here.
+
 
 In particular, this Pong vendor HFI implementation reserves 17 header slots:
 the table is 210 dwords, followed by queue storage at byte 848 (16-byte
@@ -250,7 +237,3 @@ work uses bounded synchronous completion/fault polling with IRQs masked.
 The userspace20G81 bundle is staged privately, with optional Apple heap and
 compression assumptions disabled; it is not an automatically exposed Metal
 accelerator. No GMU-only success is reported as hardware acceleration.
-
-## 许可
-
-逐文件 SPDX：`PongAdrenoCpProfile.h` 为 GPL-2.0-only（`LICENSE-GPL-2.0-only`）；`AdrenoFirmware.*`、`PongAdrenoClocks.*`、`PongAdrenoGmu.*`、`PongAdrenoHfi.*`、`PongAdrenoPlatform.cpp`、`PongAdrenoPower.*`、`PongAdrenoScanout.*`、`PongAdrenoSmmu.*`、`PongAdrenoZap.*`、`PongScanoutWire.h` 为 BSD-2-Clause-Patent（`LICENSE`）；其余为 MIT，派生自 AdrenoMetal / NativeMetal（Copyright (c) 2026 NativeMetal contributors）。

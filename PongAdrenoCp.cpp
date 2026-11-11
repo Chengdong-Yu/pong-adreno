@@ -8,6 +8,7 @@
 #include "submit/NativeAdrenoIrq.h"
 #include "submit/NativeAdrenoPwrup.h"
 #include "submit/AdrenoPM4.h"
+#include "submit/PongProcessVm.h"
 #include <IOKit/IOLib.h>
 #include <IOKit/IOMemoryDescriptor.h>
 #include <libkern/c++/OSSharedPtr.h>
@@ -51,6 +52,9 @@ struct Device {
     NativeAdrenoStatus status;
     NativeAdrenoIrq irq;
     uint32_t irq_fatal=0,irq_count=0,irq_cp_status=0,irq_protect_status=0;
+    uint32_t tableDrainFence=0;
+    uint64_t tableDrainBegan=0;
+    bool tableDrainPending=false;
     PongCpBackend backend{};
     OSSharedPtr<IOMemoryMap> zap_map;
     PongZapState zap{};
@@ -134,6 +138,9 @@ static bool faulted()
         if(fsr&SmmuContextFaultMask)
             note("GPU fault FAR/syndrome",fsr,(uint64_t(sr(p->context_offset+0x64))<<32)|sr(p->context_offset+0x60),
                 (uint64_t(sr(p->context_offset+0x68))<<32)|sr(p->context_offset+0x6c));
+        uint64_t installed=0;
+        if(!gpu->ops.smmu.read64(gpu->ops.smmu.cookie,p->context_offset+0x20,&installed))
+            note("GPU fault installed TTBR",unsigned(installed>>48),installed,gpu->tableDrainFence);
         // Gen7 A730 register definitions, captured only after a real fault.
         // Distinguish a bad nested IB from an unmapped shader data pointer.
         note("GPU fault IB1",rd(0x092a),(uint64_t(rd(0x0929))<<32)|rd(0x0928));
@@ -466,4 +473,181 @@ IOReturn PongAdrenoCpStart(PongGpuGmuDevice *gmu)
          PongAdrenoHighestBankBit,6,1,4,NativeAdrenoDeviceClientIova,0},gpu->output_bits,client_healthy};
     note("CP ready; authenticated nonsecure fence",0,fence,ticks);
     return PongAdrenoPublishClient(&gpu->backend)?kIOReturnSuccess:kIOReturnNoResources;
+}
+
+/* Upstream per-process VM policy adapted to A730's qualified32-bit aperture.
+ * Unlike the previous name-based leases, every process owns all3.5GiB of
+ * user VA. Only real BO pages consume RAM. The current native4K kit retains
+ * its proven contiguous8MiB table topology per live process; no A740 CP or
+ * preemption registers are used. CPU TTBR switching requires real ring/GX
+ * idle and preserves every kernel firmware/ring mapping at the same IOVA.
+ */
+struct PongProcessVm {
+    NativeAdrenoMemory tables;
+    ArmSmmu4KLiveArena arena{};
+    ArmSmmu4KLiveState state{};
+    ArmSmmu4KLiveVisibility visibility{};
+    ArmSmmu4KContextConfig config{};
+    NativeAdrenoVm vm;
+    uint64_t handles[5]{};
+    unsigned asid=0;
+    bool attached=false;
+};
+namespace {
+PongProcessVm *processSpaces[NativeAdrenoMaxClients]{};
+static uint64_t processRoot(const PongProcessVm *p) {
+    return p?p->state.tables.root_physical|(uint64_t(p->asid)<<48):
+        gpu->context.stateHandle()->tables.root_physical|(uint64_t(gpu->context.configHandle()->asid)<<48);
+}
+static bool ownedProcessRoot(uint64_t root) {
+    if(!gpu || !gpu->started)return false;
+    if(root==processRoot(nullptr))return true;
+    for(auto *space:processSpaces)if(space && space->state.prepared && !space->state.poisoned && space->tables.deviceReferences() && root==processRoot(space))return true;
+    return false;
+}
+static int admitProcessRoot(uint64_t expected,uint64_t observed,uint64_t unused_ttbr1) {
+    return ownedProcessRoot(expected) && ownedProcessRoot(observed) &&
+        unused_ttbr1==(uint64_t(gpu->context.configHandle()->asid)<<48);
+}
+}
+void PongGpuDiscardPreparedProcessVm(PongProcessVm *p)
+{
+    if(!p || p->attached)return;
+    // These pages have never been installed in a live process table.
+    if(p->tables.deviceReferences() && p->tables.retireAfterQuiescence())return;
+    if(!p->tables.release())delete p;
+}
+IOReturn PongGpuPrepareProcessVm(PongProcessVm **out)
+{
+    if(!out)return kIOReturnBadArgument;*out=nullptr;
+    if(!gpu || !gpu->started || !client_healthy())return kIOReturnNotReady;
+    auto *p=new PongProcessVm;if(!p)return kIOReturnNoMemory;
+    constexpr size_t tableBytes=2053*4096;
+    IOReturn status=p->tables.allocate(tableBytes,gpu->output_bits,true,tableBytes);
+    if(!status)status=NativeAdrenoPrepareSmmuMemory(&p->tables,32,gpu->output_bits,0,UINT64_C(0x100000000),0,1048576,
+        &p->arena,&p->state,&p->visibility);
+    if(status){PongGpuDiscardPreparedProcessVm(p);return status;}
+    *out=p;return kIOReturnSuccess;
+}
+IOReturn PongGpuCreateProcessVm(PongProcessVm **prepared,PongProcessVm **out,NativeAdrenoVm **vm)
+{
+    if(!prepared || !*prepared || !out || !vm)return kIOReturnBadArgument;*out=nullptr;*vm=nullptr;
+    if(!gpu || !gpu->started || !client_healthy())return kIOReturnNotReady;
+    unsigned slot=NativeAdrenoMaxClients;
+    for(unsigned i=0;i<NativeAdrenoMaxClients;++i)if(!processSpaces[i]){slot=i;break;}
+    if(slot==NativeAdrenoMaxClients)return kIOReturnNoResources;
+    auto *p=*prepared;*prepared=nullptr;
+    p->asid=16+slot;
+    ArmSmmu4KAdmitOwnedRoot=admitProcessRoot;
+    IOReturn status=kIOReturnSuccess;
+    if(!status) {
+        processSpaces[slot]=p; // retained table ownership before inactive attach
+        p->config=*gpu->context.configHandle();p->config.lower=&p->arena.config;
+        p->config.lower_tables=&p->state.tables;p->config.asid=p->asid;
+        NativeAdrenoVmRegion lower{&p->tables,&p->arena,&p->state};
+        // A full4GiB scatter/gather address space, not a256MiB client quota.
+        status=p->vm.attach(&gpu->ops.smmu,&p->config,gpu->context.streamsHandle(),&lower,nullptr,1048576,262144);
+        if(!status)p->attached=true;
+    }
+    for(unsigned i=0;!status && i<5;++i)
+        status=p->vm.map(&gpu->buffers[i],0,iovas[i],i?3:5,0,2,&p->handles[i]);
+    if(status) {
+        // No process command has run on this space. Uncertain mappings keep
+        // their backing; never free table pages after a failed transaction.
+        if(!p->vm.poisoned()) {
+            bool clean=true;
+            for(auto &h:p->handles)if(h){if(p->vm.unmap(h))clean=false;else h=0;}
+            if(clean && (!p->attached || !p->vm.detach())) {
+                if(p->tables.deviceReferences())(void)p->tables.retireAfterQuiescence();
+                if(!p->tables.release()){processSpaces[slot]=nullptr;delete p;}
+            }
+        }
+        return status;
+    }
+    processSpaces[slot]=p;*out=p;*vm=&p->vm;
+    IOLog("[gpu memory] independent ASID=%u user_va=3584MiB table_pages=%zu policy=system-memory\n",p->asid,p->state.tables.table_pages);
+    return kIOReturnSuccess;
+}
+bool PongGpuProcessSwitchPending()
+{
+    return gpu && gpu->tableDrainPending;
+}
+IOReturn PongGpuPollProcessDrain()
+{
+    if(!gpu || !gpu->started || !client_healthy())return kIOReturnNotReady;
+    if(!gpu->tableDrainPending)return kIOReturnSuccess;
+    uint32_t observedFence=0;
+    const auto state=gpu->ring.observeFence(gpu->tableDrainFence,nullptr,0,&observedFence);
+    const bool idle=state==NativeAdrenoRingFenceComplete &&
+        rd(GEN7_CP_RB_RPTR)==rd(GEN7_CP_RB_WPTR) && !(rd(GEN7_RBBM_STATUS)&(1u<<23));
+    if(idle)return kIOReturnSuccess;
+    if((state==NativeAdrenoRingFenceTimeout || state==NativeAdrenoRingFenceComplete) &&
+        now(nullptr)-gpu->tableDrainBegan<100000)return kIOReturnBusy;
+    gpu->poisoned=true;gpu->status.noteFault();
+    note("process cache drain did not complete",unsigned(state),gpu->tableDrainFence,observedFence);
+    return kIOReturnIOError;
+}
+IOReturn PongGpuSelectProcessVm(NativeAdrenoVm *vm)
+{
+    if(!gpu || !gpu->started || !vm || !client_healthy())return kIOReturnNotReady;
+    uint64_t root=0;
+    if(vm==&gpu->vm)root=processRoot(nullptr);
+    else for(auto *p:processSpaces)if(p && &p->vm==vm){root=processRoot(p);break;}
+    if(!root)return kIOReturnBadArgument;
+    auto &io=gpu->ops.smmu;const uint64_t cb=gpu->context.programResult()->context_offset;
+    uint64_t previous=0;
+    if(io.read64(io.cookie,cb+0x20,&previous) || !ownedProcessRoot(previous))return kIOReturnIOError;
+    if(previous==root && !gpu->tableDrainPending)return kIOReturnSuccess;
+    // Both the final fence and the actual CP/GX idle state are required.
+    if(!gpu->tableDrainPending && (gpu->submit.outstanding() || rd(GEN7_CP_RB_RPTR)!=rd(GEN7_CP_RB_WPTR) || (rd(GEN7_RBBM_STATUS)&(1u<<23))))
+        return kIOReturnBusy;
+    // Keep the old table installed until its actual cache-drain fence and
+    // idle state are observed. Return Busy while it runs: the owner drops
+    // the shared gate between retries instead of sleeping under that gate.
+    // selectVm also blocks the old VM from submitting during this interval.
+    if(!gpu->tableDrainPending) {
+        const IOReturn drain=gpu->ring.submitTableDrain(&gpu->tableDrainFence);
+        if(drain)return drain;
+        gpu->tableDrainBegan=now(nullptr);gpu->tableDrainPending=true;
+        return kIOReturnBusy;
+    }
+    const IOReturn drained=PongGpuPollProcessDrain();if(drained)return drained;
+    if(previous==root){gpu->tableDrainPending=false;return kIOReturnSuccess;}
+    if(io.barrier(io.cookie) || io.write64(io.cookie,cb+0x20,root) || io.barrier(io.cookie))return kIOReturnIOError;
+    uint64_t observed=0;
+    if(io.read64(io.cookie,cb+0x20,&observed) || observed!=root)return kIOReturnIOError;
+    ArmSmmu4KProgramResult sync{};
+    if(ArmSmmu4KSyncContextTlb(&io,cb,unsigned(root>>48),0,4096,&sync)!=ArmSmmu4KSuccess)return kIOReturnIOError;
+    gpu->tableDrainPending=false;
+    static uint64_t switches;
+    if(++switches<=8 || !(switches%1024))IOLog("[gpu memory] actual CPU table switch=%llu ASID=%u ring-idle=1\n",switches,unsigned(root>>48));
+    return kIOReturnSuccess;
+}
+IOReturn PongGpuDeactivateProcessVm(PongProcessVm *p)
+{
+    if(!p || !p->attached)return kIOReturnBadArgument;
+    const IOReturn drained=PongGpuPollProcessDrain();if(drained)return drained;
+    return gpu->submit.usesVm(&p->vm)?gpu->submit.selectVm(&gpu->vm):kIOReturnSuccess;
+}
+IOReturn PongGpuDestroyProcessVm(PongProcessVm *p,PongProcessVm **retired)
+{
+    if(!retired)return kIOReturnBadArgument;*retired=nullptr;
+    if(!p || !p->attached)return kIOReturnBadArgument;
+    gpu->submit.cancelAdmission(&p->vm);
+    // An enumeration probe that never submitted did not install its table.
+    // Destroy it without switching the active compositor into the kernel VM.
+    if(gpu->submit.usesVm(&p->vm)) {
+        const IOReturn selected=gpu->submit.selectVm(&gpu->vm);if(selected)return selected;
+    }
+    uint64_t installed=0;
+    if(gpu->ops.smmu.read64(gpu->ops.smmu.cookie,gpu->context.programResult()->context_offset+0x20,&installed) ||
+       installed==processRoot(p))return kIOReturnBusy;
+    for(auto &h:p->handles)if(h){const IOReturn status=p->vm.unmap(h);if(status)return status;h=0;}
+    ArmSmmu4KProgramResult sync{};
+    if(ArmSmmu4KSyncContextTlb(&gpu->ops.smmu,gpu->context.programResult()->context_offset,p->asid,0,4096,&sync)!=ArmSmmu4KSuccess)
+        return kIOReturnIOError;
+    IOReturn status=p->vm.detach();if(status)return status;
+    if(p->tables.deviceReferences()){status=p->tables.retireAfterQuiescence();if(status)return status;}
+    for(auto &space:processSpaces)if(space==p){space=nullptr;break;}
+    p->attached=false;*retired=p;return kIOReturnSuccess;
 }

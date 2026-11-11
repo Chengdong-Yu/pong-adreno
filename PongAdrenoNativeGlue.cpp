@@ -28,8 +28,12 @@ bool PongAdrenoConfigureService(IOService *service)
     service->setProperty("PongNativePageBytes",4096,32);
     unsigned metal=0;
     const bool enabled=PE_parse_boot_argn("pong_metal",&metal,sizeof(metal)) && metal==1;
-    #if PONG_GUEST_22H374
+    #if PONG_GUEST_DARWIN24 || PONG_GUEST_22H374 || PONG_GUEST_22G100
+    #if PONG_GUEST_22G100
+    service->setProperty("PongMetal22G100Enabled",enabled);
+    #else
     service->setProperty("PongMetal22H374Enabled",enabled);
+    #endif
     unsigned global=0;
     if(enabled && PE_parse_boot_argn("pong_metal_global",&global,sizeof(global)) && global==1)
         service->setProperty("PongNativeMetalGlobal",kOSBooleanTrue);
@@ -38,7 +42,7 @@ bool PongAdrenoConfigureService(IOService *service)
 #endif
     if(enabled)service->setProperty("NativeSandboxGrantProcess",
         "backboardd,SpringBoard,CollectionsPoster,WidgetRenderer_Default,PosterBoard,Weather,WeatherPoster,GradientPosterExtension"
-#if PONG_GUEST_22H374
+#if PONG_GUEST_DARWIN24 || PONG_GUEST_22H374 || PONG_GUEST_22G100
         ",Preferences,LegacyPoster,MercuryPosterExtension,Unity2025Poster,PridePosterExtension"
 #endif
     );

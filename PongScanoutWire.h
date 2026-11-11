@@ -4,6 +4,9 @@
 #include <stdint.h>
 enum {PongScanoutVersion=2,PongScanoutBgra=1,PongScanoutMode=0x7000,
       PongScanoutWait=0x7002,PongScanoutComplete=0x7003,PongScanoutResetSources=0x7004,PongScanoutMemory=0x5343};
+// Root-only observation of the real firmware framebuffer. This does not
+// acquire the presenter's connection or grant write access to scanout.
+enum {PongScanoutDiagnosticMemory=0x5344,PongScanoutDiagnosticMode=0x7200};
 // A presenter rejected the frame before committing any GPU command. This is
 // distinct from a failed/unknown fence: CPU fallback cannot race DMA here.
 enum : uint32_t {PongScanoutNotSubmitted=0x4e4f444d};

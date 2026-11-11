@@ -85,6 +85,9 @@ public:
     /* User command buffers: the A7XX BR/BV thread framing of a7xx_submit() around the words (CP init and the kernel's own
      * bring-up packets keep the plain submit() above, as Linux sends them outside a7xx_submit()). */
     IOReturn submitFramed(const uint32_t *words,size_t word_count,uint32_t *fence);
+    // Real old-address-space cache drain before a CPU TTBR write. Its
+    // timestamp is observed before the board changes tables.
+    IOReturn submitTableDrain(uint32_t *fence);
     /* The next framed submission starts with the A7XX context entry of a6xx_set_pagetable() (BR/BV counters, on-chip
      * timestamps and resource table cleared between thread syncs). The submit
      * owner requests this on actual client changes and reused client slots. */

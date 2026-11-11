@@ -11,4 +11,6 @@ IOReturn pong_scanout_connect(task_t);
 void pong_scanout_disconnect(task_t);
 IOReturn pong_scanout_call(task_t,unsigned,const void *,size_t,void *,size_t);
 IOMemoryDescriptor *pong_scanout_memory(task_t);
+IOMemoryDescriptor *pong_scanout_diagnostic_memory(void);
+IOReturn pong_scanout_diagnostic_mode(PongScanoutModeInfo *);
 }

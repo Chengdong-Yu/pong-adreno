@@ -381,10 +381,14 @@ IOReturn NativeAdrenoUserClient::submitRecords(const void *input,uint32_t capaci
     }
     uint32_t fence=0;
     used_=true;
-    submit_->nextPriority(submitPriority(),proc_selfpid(),proc_get_effective_task_policy(current_task(),IMP_TASK_POLICY_ROLE));
+    const int32_t priority=submitPriority();
+    const IOReturn selected=submit_->admitVm(vm_,queue_base_/NativeAdrenoAbiMaxQueues,priority,proc_selfpid());
+    if(selected)return selected;
+    submit_->nextPriority(priority,proc_selfpid(),proc_get_effective_task_policy(current_task(),IMP_TASK_POLICY_ROLE));
     const IOReturn status=submit_->submit(buffers,request->buffer_count,
         queue_base_+static_cast<uint32_t>(request->queue),&fence,window_start_,window_bytes_);
-    if(status)return status;
+    if(status){if(status!=kIOReturnBusy)submit_->cancelAdmission(vm_);return status;}
+    submit_->admissionAccepted(queue_base_/NativeAdrenoAbiMaxQueues);
     reply->fence=fence;
     return kIOReturnSuccess;
 }

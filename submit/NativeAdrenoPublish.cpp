@@ -1,12 +1,11 @@
 /* SPDX-License-Identifier: MIT */
-/* IOKit surface for an already-running GPU context. The board code (kits/sheng) brings the GPU up, then hands this file
- * the live VM, submit object, ring, clock and optional timer; one IOService is published and each IOServiceOpen creates a
- * connection that mounts its own NativeAdrenoUserClient core. Up to NativeAdrenoMaxClients connections (one per Metal process) share
- * the VM, the submit object and the ring: each core has its own handles, its own queue range on the ring and its own window of the
- * one GPU address space (the render server the large one), and closing a connection waits for its own jobs only, then unmaps and
- * frees everything it created. Not yet done: per-process GPU page tables (the windows are enforced by the driver, not by the SMMU)
- * and a reset path. This is not the Metal or Turnip ABI; it carries NativeAdrenoABI.h unchanged.
- * BO CPU mappings are handed out as uncached physical-range mappings to match the GPU's non-cacheable PTEs.
+/* IOKit surface for Pong's running A730 context. Each Metal connection owns
+ * an independent native4K GPU page table and the complete qualified32-bit
+ * user aperture. BOs and queue ownership are per connection. The single CP
+ * ring is shared; a CPU table switch requires real fence, cache-drain and
+ * GX-idle completion. Failed DMA teardown retains its tables and BOs.
+ * System BO views share the prepared WC memory object; imported IOSurfaces
+ * retain their actual descriptor and native cache-ownership handoff.
  * The connection class is named AGXDeviceUserClient on purpose: the original sandbox profiles of the processes that use Metal
  * allow IOServiceOpen for that user-client class name, and nothing else in this system can create one (the Apple AGX kext is
  * never loaded without an Apple GPU), so the name only decides whether the Adreno Metal plugin may open its own driver. */
@@ -21,6 +20,7 @@
 #include <kern/clock.h>
 #include <pexpert/pexpert.h>
 #include "NativeAdrenoUserClient.h"
+#include "PongProcessVm.h"
 #include "../PongAdrenoScanout.h"
 #include "NativeGpuTrace.inc"
 extern "C" unsigned kauth_cred_getuid(void *);
@@ -113,10 +113,11 @@ volatile uint32_t native_adreno_mount_fail[4];
 struct NativeAdrenoAskerRecord {char name[20]; uint32_t reads;};
 struct NativeAdrenoAskerRecord native_adreno_metal_askers[12];
 }
-/* ABI1 still shares one32-bit space. Keep both UI reservations unchanged;
- * lease the remaining VA by live process demand instead of wasting fourteen
- * fixed128MiB windows. These are VA leases, never wired RAM reservations. */
+/* ABI1 wire addresses remain32-bit; each actual user connection owns an
+ * independent page table and receives its full user aperture. */
 struct NativeAdrenoClientWindow {uint64_t start=0,bytes=0;};
+static constexpr uint64_t ClientVaStart=0x20000000ull,ClientVaEnd=0x100000000ull;
+
 
 namespace {
 void shiftName(char names[3][17]) {
@@ -140,32 +141,13 @@ struct Published {
     uint32_t input_bits=0,output_bits=0;
     uint32_t opened=0,closed=0;
 } g;
-static NativeAdrenoClientWindow clientWindow(unsigned slot,const char *name)
+static NativeAdrenoClientWindow clientWindow(unsigned slot,const char *)
 {
-    if(slot==0)return {0x20000000ull,0x50000000ull};
-    if(slot==1)return {0x70000000ull,0x20000000ull};
-    bool poster=false;
-    for(unsigned at=0;at<20 && name[at];++at)
-        if(!strncmp(name+at,"Poster",6) || !strncmp(name+at,"Wallpaper",9)) {poster=true;break;}
-    // MercuryPoster hit real device-VA OOM with128MiB while importing its
-    // FP16 targets. Prefer384MiB for posters,256MiB for input/preferences,
-    //128MiB otherwise. Search actual holes; never relocate a live mapping.
-    uint64_t preferred=poster?0x18000000ull:
-        (!strcmp(name,"InputUI") || !strcmp(name,"Preferences"))?0x10000000ull:0x08000000ull;
-    for(uint64_t amount=preferred;amount>=0x04000000ull;amount-=0x04000000ull) {
-        uint64_t start=0x90000000ull;
-        for(unsigned pass=0;pass<=NativeAdrenoMaxClients && start+amount<=0x100000000ull;++pass) {
-            uint64_t next=start;
-            for(unsigned i=2;i<NativeAdrenoMaxClients;++i)if(g.slots[i]) {
-                const auto &window=g.windows[i];
-                if(start<window.start+window.bytes && window.start<start+amount && next<window.start+window.bytes)
-                    next=window.start+window.bytes;
-            }
-            if(next==start)return {start,amount};
-            start=next;
-        }
-    }
-    return {};
+    // Same policy as upstream: one complete user aperture per independent
+    // address space, with physical BOs charged to the allocating process.
+    // A730 ABI1 remains32-bit; no live mappings or firmware IOVAs move.
+    if(slot>=NativeAdrenoMaxClients)return {};
+    return {ClientVaStart,ClientVaEnd-ClientVaStart};
 }
 }
 
@@ -185,6 +167,7 @@ class AGXDeviceUserClient : public IOUserClient {
     IOBufferMemoryDescriptor *traceSnapshots_[2]{};
     task_t handoffTask_=nullptr;
     bool kernel_=false;
+    PongProcessVm *space_=nullptr;
     NativeAdrenoUserClient *core_=nullptr;   /* own core; deleted in free(), so a call that raced the close sees live_ false, never freed memory */
     unsigned slot_=NativeAdrenoMaxClients;
     char name_[20]{};
@@ -257,11 +240,23 @@ static NativeAdrenoClientRecord *clientRecord(const char *name)
 IOReturn AGXDeviceUserClient::mount(bool kernel)
 {
     proc_selfname(name_,sizeof name_);
+    // This policy updates only the verified native camera executable and
+    // runs outside the GPU gate; memorystatus/VM never nest beneath it.
+    if(!kernel && !strncmp(name_,"cameracaptured",sizeof name_)) {
+        extern int pong_gpu_memory_admit_current(void) __asm__("_pong_gpu_memory_admit_current");
+        const int admitted=pong_gpu_memory_admit_current();
+        if(admitted)IOLog("Pong GPU: native camera memory allowance not applied errno=%d\n",admitted);
+    }
     NativeAdrenoUserClient *core=new NativeAdrenoUserClient;
     if(!core)return kIOReturnNoMemory;
+    PongProcessVm *prepared=nullptr,*retired=nullptr;
+    if(!kernel) {
+        const IOReturn status=PongGpuPrepareProcessVm(&prepared);
+        if(status){delete core;return status;}
+    }
     IOLockLock(g.lock);
     bool ok=false;
-    /* The render server takes slot 0 (the large window) when free; every other process, or a second render-server connection, the next free one. */
+    /* Slots identify queue ownership and diagnostics, not GPU-memory quotas. */
     unsigned slot=NativeAdrenoMaxClients;
     if(kernel)slot=g.kernel_client?NativeAdrenoMaxClients:0;
     else {
@@ -269,7 +264,10 @@ IOReturn AGXDeviceUserClient::mount(bool kernel)
         if(!strncmp(name_,"SpringBoard",sizeof name_) && !g.slots[1])slot=1;
         for(unsigned i=2;slot==NativeAdrenoMaxClients && i<NativeAdrenoMaxClients;++i)if(!g.slots[i])slot=i;
     }
-    const IOReturn opened=slot<NativeAdrenoMaxClients?core->open(NativeAdrenoAbiVersion,g.vm,g.submit,g.ring,g.input_bits,g.output_bits):kIOReturnNoSpace;
+    PongProcessVm *space=nullptr;NativeAdrenoVm *vm=g.vm;
+    IOReturn opened=slot<NativeAdrenoMaxClients?kIOReturnSuccess:kIOReturnNoSpace;
+    if(!opened && !kernel)opened=PongGpuCreateProcessVm(&prepared,&space,&vm);
+    if(!opened)opened=core->open(NativeAdrenoAbiVersion,vm,g.submit,g.ring,g.input_bits,g.output_bits);
     IOReturn result=opened;
     if(opened!=kIOReturnSuccess) {native_adreno_mount_fail[0]=slot<NativeAdrenoMaxClients?2:1;native_adreno_mount_fail[1]=uint32_t(opened);native_adreno_mount_fail[2]=slot;native_adreno_mount_fail[3]=native_adreno_mount_fail[3]+1;}
     if(opened==kIOReturnSuccess) {
@@ -282,10 +280,10 @@ IOReturn AGXDeviceUserClient::mount(bool kernel)
             core->setScope(slot*NativeAdrenoAbiMaxQueues,window.start,window.bytes):kIOReturnNoSpace;
         result=scoped;
         if(scoped==kIOReturnSuccess) {
-            core_=core;core=nullptr;slot_=slot;kernel_=kernel;live_=true;ok=true;
+            core_=core;core=nullptr;space_=space;space=nullptr;slot_=slot;kernel_=kernel;live_=true;ok=true;
             if(kernel)g.kernel_client=true;else {
                 g.windows[slot]=window;g.slots[slot]=true;
-                IOLog("NativeAdreno: %s VA lease=%uMiB start=0x%llx slot=%u\n",name_,unsigned(window.bytes>>20),(unsigned long long)window.start,slot);
+                IOLog("NativeAdreno: %s independent VA=%uMiB start=0x%llx slot=%u\n",name_,unsigned(window.bytes>>20),(unsigned long long)window.start,slot);
             }
             ++g.opened;
             if(NativeAdrenoClientRecord *record=clientRecord(name_))record->slot=slot;
@@ -311,7 +309,13 @@ IOReturn AGXDeviceUserClient::mount(bool kernel)
         if(gMailboxOwner)gMailboxOwner->release();
         retain();gMailboxOwner=this;
     }
+    if(space) {
+        const IOReturn discarded=PongGpuDestroyProcessVm(space,&retired);
+        if(discarded)IOLog("Pong GPU: unused process VM retained after mount failure status=%x\n",discarded);
+    }
     IOLockUnlock(g.lock);
+    PongGpuDiscardPreparedProcessVm(prepared);
+    PongGpuDiscardPreparedProcessVm(retired);
     if(core)delete core;
     if(result)IOLog("Pong Adreno: client %s mount failed slot=%u opened=0x%x result=0x%x\n",name_,slot,opened,result);
     return result;
@@ -350,6 +354,7 @@ IOReturn AGXDeviceUserClient::dropViews(uint32_t token)
 }
 IOReturn AGXDeviceUserClient::clientClose()
 {
+    PongProcessVm *retired=nullptr;
     if(handoffOnly_ && handoffTask_) {pong_scanout_disconnect(handoffTask_);handoffTask_=nullptr;}
     IOLockLock(g.lock);
     closing_=true;
@@ -362,19 +367,24 @@ IOReturn AGXDeviceUserClient::clientClose()
     if(gMailboxOwner==this) {mailbox=gMailboxOwner;gMailboxOwner=nullptr;}
     if(live_) {
         const uint64_t peak=core_->windowPeak();
-        /* This client's unmaps alter the same table used by every other
-         * client. Drain globally, yielding the gate between polls. Waiting
-         * for two seconds inside releaseAll used to block every GPU caller
-         * and could still unmap while another client's work was in flight. */
+        /* Keep the shared ring quiescent while detaching a process table.
+         * Yield the gate between completion polls; no forced DMA teardown. */
         const uint64_t began=g.clock.now_us(g.clock.cookie);
         for(;;) {
-            status=pong_adreno_native_healthy()?g.submit->waitAll(&g.clock,0):kIOReturnNotReady;
+            status=PongGpuPollProcessDrain();
+            if(!status)status=pong_adreno_native_healthy()?g.submit->waitAll(&g.clock,0):kIOReturnNotReady;
+            // Drain and remove an installed old table before releaseAll
+            // can unmap/free its resources. A cache-drain Busy needs the
+            // same gate-free retry as a real unfinished user fence.
+            if(!status && space_)status=PongGpuDeactivateProcessVm(space_);
+            if(status==kIOReturnBusy)status=kIOReturnTimeout;
             if(status!=kIOReturnTimeout || g.clock.now_us(g.clock.cookie)-began>=500000)break;
             IOLockUnlock(g.lock);
             if(g.clock.idle)g.clock.idle(g.clock.cookie);else IOSleep(1);
             IOLockLock(g.lock);
         }
         if(!status)status=core_->releaseAll(&g.clock,0);
+        if(!status && space_) {status=PongGpuDestroyProcessVm(space_,&retired);if(!status)space_=nullptr;}
         /* A failed teardown leaves the objects live and the slot taken: nothing is forced or reused. */
         if(!status) {
             live_=false;
@@ -387,6 +397,7 @@ IOReturn AGXDeviceUserClient::clientClose()
         }
     }
     IOLockUnlock(g.lock);
+    PongGpuDiscardPreparedProcessVm(retired);
     if(mailbox)mailbox->release();
     if(!status)terminate();
     return status;
@@ -394,7 +405,7 @@ IOReturn AGXDeviceUserClient::clientClose()
 void AGXDeviceUserClient::free()
 {
     if(handoffOnly_ && handoffTask_) {pong_scanout_disconnect(handoffTask_);handoffTask_=nullptr;}
-    for(auto *snapshot:traceSnapshots_)if(snapshot)snapshot->release();
+    for(auto *snapshot:traceSnapshots_)if(snapshot){snapshot->complete();snapshot->release();}
     (void)dropViews(0);
     if(views_) {IODelete(views_,View,MaxViews);views_=nullptr;}
     /* Still live only when a teardown failed: its objects stay referenced by the VM and the ring, so the core is kept, not freed. */
@@ -406,6 +417,14 @@ IOReturn AGXDeviceUserClient::clientMemoryForType(UInt32 type,IOOptionBits *opti
     if(memory)*memory=nullptr;
     if(!memory || !options)return kIOReturnBadArgument;
     IOReturn status=kIOReturnNotFound;
+    if(type==PongScanoutDiagnosticMemory) {
+        if(kauth_cred_getuid(kauth_cred_get())!=0)return kIOReturnNotPrivileged;
+        if(!native_gpu_trace_enabled())return kIOReturnNotReady;
+        auto *source=pong_scanout_diagnostic_memory();
+        if(!source)return kIOReturnNotReady;
+        *memory=source;*options=kIOMapAnywhere|kIOMapReadOnly|kIOMapInhibitCache;
+        return kIOReturnSuccess;
+    }
     // Root-only snapshots use ordinary IOKit mapped memory, avoiding a new
     // UFS/export region or large inline Mach replies. Each returned buffer
     // owns its copied data until the helper unmaps it; no GPU gate is held.
@@ -417,12 +436,23 @@ IOReturn AGXDeviceUserClient::clientMemoryForType(UInt32 type,IOOptionBits *opti
         const uint32_t capacity=type==0x4754?sizeof(NativeGpuTraceHeader)+
             (NativeGpuTraceCapacity+NativeGpuTraceMetadata+(gpuPixels?NativeGpuCaptureRecords*NativeGpuPixelSlots:0))*sizeof(NativeGpuTraceRecord):
             16+NativeGpuPixelSlots*(sizeof(NativeGpuPixelHeader)+NativeGpuPixelBytes);
-        auto buffer=IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task,kIODirectionInOut,capacity,4096);
+        const uint32_t mapped=(capacity+4095u)&~4095u;
+        auto buffer=IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task,
+            IOOptionBits(kIODirectionInOut)|IOOptionBits(kIOMemoryKernelUserShared)|
+            IOOptionBits(kIOMemoryPageable),mapped,4096);
         if(!buffer)return kIOReturnNoMemory;
+        // Use a VM memory-entry backed descriptor, as the system BO path
+        // does. The nonpageable raw physical pager cannot represent every
+        // fragmented snapshot on Darwin24's 4K kernel / 16K user map.
+        const IOReturn prepared=buffer->prepare();
+        if(prepared){buffer->release();return prepared;}
+        bzero(buffer->getBytesNoCopy(),mapped);
         const uint32_t size=type==0x4754?native_gpu_trace_snapshot(buffer->getBytesNoCopy(),capacity):
             native_gpu_pixel_snapshot(buffer->getBytesNoCopy(),capacity);
-        if(!size){buffer->release();return kIOReturnNotReady;}
-        buffer->setLength(size);traceSnapshots_[index]=buffer;buffer->retain();*memory=buffer;*options=kIOMapAnywhere|kIOMapReadOnly;return kIOReturnSuccess;
+        if(!size){buffer->complete();buffer->release();return kIOReturnNotReady;}
+        // Map full, zeroed native pages. The helper uses the snapshot header
+        // for its logical length; an odd byte length is not a VM mapping ABI.
+        traceSnapshots_[index]=buffer;buffer->retain();*memory=buffer;*options=kIOMapAnywhere|kIOMapReadOnly;return kIOReturnSuccess;
     }
     if(type==NativeAdrenoScanoutType) {
         if(!live_ && !handoffOnly_)return kIOReturnNotReady;
@@ -587,6 +617,17 @@ static IOReturn runCore(AGXDeviceUserClient *connection,uint32_t method,const vo
         }
         IOLockLock(g.lock);
         status=connection->live_ && !connection->closing_?kIOReturnSuccess:kIOReturnNotReady;
+        // Cache-drain DMA still owns the old VM. Observe it outside the
+        // shared gate before any method can unmap/free or alter that VM.
+        // Submit retries already use Busy; ordinary BO calls keep their
+        // existing success/error contract and sleep with the gate dropped.
+        while(!status && method!=NativeAdrenoMethodSubmit && method!=NativeAdrenoMethodSubmitBatch &&
+              (status=PongGpuPollProcessDrain())==kIOReturnBusy) {
+            IOLockUnlock(g.lock);
+            if(g.clock.idle)g.clock.idle(g.clock.cookie);else IOSleep(1);
+            IOLockLock(g.lock);
+            status=connection->live_ && !connection->closing_?kIOReturnSuccess:kIOReturnNotReady;
+        }
         if(!status && method==NativeAdrenoMethodBoFree) {
             /* The client's resources may be referenced by its IBs, not just
              * the IB BO itself. Drain its whole queue range before a free;
@@ -631,7 +672,7 @@ IOReturn AGXDeviceUserClient::run(uint32_t method,const void *input,size_t input
     if(method==NativeGpuTraceMethod) {
         if(!input || input_size!=sizeof(NativeGpuTraceRecord) || output_size)return kIOReturnBadArgument;
         const auto *record=static_cast<const NativeGpuTraceRecord *>(input);
-        if(record->event<30 || record->event>63)return kIOReturnBadArgument;
+        if((record->event<30 || record->event>63) && record->event!=65 && record->event!=69)return kIOReturnBadArgument;
         native_gpu_trace_record(record->event,proc_selfpid(),record->value,12);return kIOReturnSuccess;
     }
     if(method==NativeGpuPixelMethod) {
@@ -699,6 +740,15 @@ IOReturn AGXDeviceUserClient::action(OSObject *target,void *,IOExternalMethodArg
 IOReturn AGXDeviceUserClient::externalMethod(uint32_t selector,IOExternalMethodArguments *arguments,
     IOExternalMethodDispatch *,OSObject *target,void *reference)
 {
+    if(selector==PongScanoutDiagnosticMode) {
+        if(kauth_cred_getuid(kauth_cred_get())!=0)return kIOReturnNotPrivileged;
+        if(!native_gpu_trace_enabled())return kIOReturnNotReady;
+        if(!arguments || arguments->scalarInputCount || arguments->scalarOutputCount ||
+           arguments->structureInputSize || arguments->structureInputDescriptor ||
+           !arguments->structureOutput || arguments->structureOutputDescriptor ||
+           arguments->structureOutputSize!=sizeof(PongScanoutModeInfo))return kIOReturnBadArgument;
+        return pong_scanout_diagnostic_mode(static_cast<PongScanoutModeInfo *>(arguments->structureOutput));
+    }
     if((selector==NativeGpuTraceMethod || selector==NativeGpuPixelMethod) && arguments)
         return run(selector,arguments->structureInput,arguments->structureInputSize,
                    arguments->structureOutput,arguments->structureOutputSize);

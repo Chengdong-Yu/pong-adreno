@@ -3,6 +3,7 @@
 #include "NativeGpuTrace.h"
 #include "NativeAdrenoSubmit.h"
 #include "NativeAdrenoABI.h"
+#include "PongProcessVm.h"
 #include "AdrenoPM4.h"
 #include <IOKit/IOLib.h>
 #include <kern/clock.h>
@@ -69,7 +70,7 @@ IOReturn NativeAdrenoSubmit::release(Job &job)
     // or VA lease. Real fence observation/BO reference retirement stay per job.
     const unsigned context=job.queue/NativeAdrenoAbiMaxQueues;
     const uint32_t completed=ring_->completedFence();
-    AcquiredWindow *acquired=context<16?&acquired_[context]:nullptr;
+    AcquiredWindow *acquired=context<NativeAdrenoMaxClients?&acquired_[context]:nullptr;
     if(!acquired || !acquired->valid || acquired->completed!=completed ||
        acquired->start!=job.window_start || acquired->bytes!=job.window_bytes) {
         if(vm_->acquireImported(job.window_start,job.window_bytes))return poison();
@@ -99,6 +100,65 @@ IOReturn NativeAdrenoSubmit::release(Job &job)
     (void)ring_->timeline(job.fence,&start,&end);
     gpuTraceEvent(GpuTraceRetire,job.pid,job.fence,job.queue,0,job.submit_us,start,end,end>start,0);
     job={};return kIOReturnSuccess;
+}
+IOReturn NativeAdrenoSubmit::selectVm(NativeAdrenoVm *vm)
+{
+    if(!attached_ || poisoned_ || !vm || vm->poisoned())return kIOReturnNotReady;
+    if(vm==vm_ && !PongGpuProcessSwitchPending())return kIOReturnSuccess;
+    const IOReturn retired=retireCompleted();if(retired)return retired;
+    if(outstanding())return kIOReturnBusy;
+    const IOReturn switched=PongGpuSelectProcessVm(vm);if(switched)return switched;
+    vm_=vm;current_context_=UINT32_MAX;ring_->requestContextReset();
+    for(auto &entry:acquired_)entry.valid=false;
+    return kIOReturnSuccess;
+}
+void NativeAdrenoSubmit::cancelAdmission(const NativeAdrenoVm *vm)
+{
+    for(auto &entry:admission_)if(entry.vm==vm)entry={};
+}
+IOReturn NativeAdrenoSubmit::admitVm(NativeAdrenoVm *vm,uint32_t context,int32_t priority,int32_t pid)
+{
+    if(!attached_||poisoned_||!vm||vm->poisoned())return kIOReturnNotReady;
+    if(context>=NativeAdrenoMaxClients)return kIOReturnBadArgument;
+    if(!native_adreno_vm_now_us)return selectVm(vm);
+    const uint64_t now=native_adreno_vm_now_us();
+    // Busy retries happen outside the shared gate. Advisory tickets expire
+    // if the caller exits or ceases retrying; they never own BOs or fences.
+    for(auto &entry:admission_)if(entry.vm&&now-entry.last>16000)entry={};
+    auto &request=admission_[context];
+    if(request.vm!=vm)request={vm,now,now,priority,pid};
+    request.last=now;request.priority=priority;
+    auto rank=[](int32_t p){return p==5?5:p==0?4:p==4?3:p==1?2:p==2?1:0;};
+    unsigned selected=context;
+    for(unsigned i=0;i<NativeAdrenoMaxClients;i++) {
+        const auto &candidate=admission_[i];if(!candidate.vm)continue;
+        const auto &best=admission_[selected];
+        const bool aged=now-candidate.first>=16000,best_aged=now-best.first>=16000;
+        if((aged&&!best_aged)||((aged==best_aged)&&
+           ((aged&&candidate.first<best.first)||(!aged&&
+            (rank(candidate.priority)>rank(best.priority)||
+             (rank(candidate.priority)==rank(best.priority)&&candidate.first<best.first))))))selected=i;
+    }
+    if(selected!=context) {
+        // Fresh equal-priority contenders can share the currently installed
+        // table briefly. After4ms their next burst yields so the ring drains;
+        // a waiting higher-priority client does not need to wait that slice.
+        const auto &best=admission_[selected];
+        if(vm!=vm_||rank(best.priority)>rank(priority)||now-best.first>=4000) {
+            ++admission_yields_;return kIOReturnBusy;
+        }
+    }
+    const IOReturn result=selectVm(vm);
+    if(result){if(result==kIOReturnBusy)++admission_yields_;return result;}
+    return kIOReturnSuccess;
+}
+void NativeAdrenoSubmit::admissionAccepted(uint32_t context)
+{
+    if(context>=NativeAdrenoMaxClients||!native_adreno_vm_now_us)return;
+    auto &request=admission_[context];if(!request.vm)return;
+    const uint64_t waited=native_adreno_vm_now_us()-request.first;
+    admission_wait_us_+=waited;if(waited>admission_max_us_)admission_max_us_=waited;++admission_turns_;
+    request={};
 }
 IOReturn NativeAdrenoSubmit::detach()
 {
@@ -159,11 +219,16 @@ IOReturn NativeAdrenoSubmit::submit(const NativeAdrenoSubmitBuffer *buffers,size
     size_t client_pending=0;
     for(const auto &pending:jobs_)if(pending.active && pending.pid==next_pid_)++client_pending;
     const bool low=next_priority_==2 || next_priority_==3;
-    const size_t cap=low?1:next_priority_==1?2:8;
+    bool competing=false;
+    for(const auto &request:admission_)if(request.vm&&request.vm!=vm_){competing=true;break;}
+    // A730 cannot preempt the accepted IBs of even a high-priority client.
+    // Once another VM is actually waiting, don't append eight jobs behind
+    // the current one. Priority still selects the next admissible VM.
+    const size_t cap=low||competing?1:next_priority_==1?2:8;
     if(client_pending>=cap){++admission_yields_;return kIOReturnBusy;}
     const uint64_t began=native_adreno_vm_now_us?native_adreno_vm_now_us():0;
     const unsigned cache_context=queue/NativeAdrenoAbiMaxQueues;
-    if(cache_context<16)acquired_[cache_context].valid=false;
+    if(cache_context<NativeAdrenoMaxClients)acquired_[cache_context].valid=false;
     Job *job=free();
     if(!job)return kIOReturnBusy;
     for(size_t i=0;i<handle_count;++i) {
@@ -296,6 +361,8 @@ IOReturn NativeAdrenoSubmit::submit(const NativeAdrenoSubmitBuffer *buffers,size
             (unsigned long long)native_adreno_cache_batches[0],(unsigned long long)native_adreno_cache_batches[1],
             (unsigned long long)native_adreno_cache_batches[2]);
         IOLog("[gpu acquire] handoffs=%u duplicate-retirements-skipped=%u\n",native_adreno_acquire_batches[0],native_adreno_acquire_batches[1]);
+        IOLog("[gpu admission] turns=%llu wait_us=%llu max_us=%llu yields=%llu aged_us=16000\n",
+            admission_turns_,admission_wait_us_,admission_max_us_,admission_yields_);
         IOLog("[gpu host batches] calls=%llu ranges=%llu entries=%llu total_us=%llu\n",
             (unsigned long long)native_adreno_host_batch_stats[0],(unsigned long long)native_adreno_host_batch_stats[1],
             (unsigned long long)native_adreno_host_batch_stats[2],(unsigned long long)native_adreno_host_batch_stats[3]);

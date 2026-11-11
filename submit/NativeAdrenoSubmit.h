@@ -3,6 +3,7 @@
 #define NATIVE_ADRENO_SUBMIT_H
 #include "NativeAdrenoRing.h"
 #include "NativeAdrenoVm.h"
+#include "NativeAdrenoClientLimits.h"
 
 struct NativeAdrenoSubmitBuffer {
     uint64_t handle;
@@ -49,8 +50,11 @@ class NativeAdrenoSubmit final {
     int32_t next_priority_=1,next_pid_=0,next_role_=0;
     uint64_t slow_window_=0;unsigned slow_logged_=0;
     uint64_t admission_yields_=0;
+    struct Admission {NativeAdrenoVm *vm=nullptr;uint64_t first=0,last=0;int32_t priority=1,pid=0;};
+    Admission admission_[NativeAdrenoMaxClients]{};
+    uint64_t admission_wait_us_=0,admission_max_us_=0,admission_turns_=0;
     struct AcquiredWindow {uint64_t start=0,bytes=0;uint32_t completed=0;bool valid=false;};
-    AcquiredWindow acquired_[16]{};
+    AcquiredWindow acquired_[NativeAdrenoMaxClients]{};
     /* Serialized by the owner; a 128-IB batch must not consume kernel stack
      * with its 1 KiB handle list and 2 KiB packet list. */
     uint64_t scratch_handles_[128]{};
@@ -65,6 +69,16 @@ public:
     NativeAdrenoSubmit(const NativeAdrenoSubmit &)=delete;
     NativeAdrenoSubmit &operator=(const NativeAdrenoSubmit &)=delete;
     IOReturn attach(NativeAdrenoVm *,NativeAdrenoRing *);
+    // Upstream CPU table-switch mode: change VM only after retiring every
+    // genuine prior fence. Busy is retried outside the shared device gate.
+    IOReturn selectVm(NativeAdrenoVm *);
+    // A730 has one ring. Stop admitting another burst from the installed
+    // VM when a competing real submission has priority or has aged. Every
+    // accepted fence still completes before an actual page-table switch.
+    IOReturn admitVm(NativeAdrenoVm *,uint32_t context,int32_t priority,int32_t pid);
+    void admissionAccepted(uint32_t context);
+    void cancelAdmission(const NativeAdrenoVm *);
+    bool usesVm(const NativeAdrenoVm *vm) const {return vm_==vm;}
     /* Refuses while jobs are outstanding or poisoned; the caller must have
      * stopped the GPU and observed every fence before calling this. */
     IOReturn detach();

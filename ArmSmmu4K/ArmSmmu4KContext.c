@@ -1,5 +1,6 @@
 /* SPDX-License-Identifier: MIT */
 #include "ArmSmmu4KContext.h"
+int (*ArmSmmu4KAdmitOwnedRoot)(uint64_t,uint64_t,uint64_t)=0;
 static int width_code(unsigned bits)
 {
     switch(bits) {case 32:return 0;case 36:return 1;case 40:return 2;
@@ -15,7 +16,7 @@ static int region_valid(const ArmSmmu4KConfig *c,const ArmSmmu4KResult *r,unsign
     if(!c || !r)return !c && !r;
     if(c->input_bits<32 || c->input_bits>48 || width_code(c->output_bits)<0 ||
         (c->table_physical&4095) || r->root_physical!=c->table_physical ||
-        r->mair!=0xff44 || r->upper_region!=upper || !r->table_pages ||
+        (r->mair!=0xff44 && r->mair!=0x04ff44) || r->upper_region!=upper || !r->table_pages ||
         r->leaf_pages>c->leaf_budget || r->table_pages>UINT64_MAX/4096 ||
         r->start_level!=4-(c->input_bits-12+8)/9)return 0;
     uint64_t limit=UINT64_C(1)<<c->output_bits;
@@ -61,7 +62,7 @@ ArmSmmu4KStatus ArmSmmu4KEncodeContext(const ArmSmmu4KContextConfig *c,
     v.ttbr0=(uint64_t)c->asid<<48;v.ttbr1=v.ttbr0;
     if(c->lower)v.ttbr0|=c->lower_tables->root_physical;
     if(c->upper)v.ttbr1|=c->upper_tables->root_physical;
-    v.mair0=0xff44;v.mair1=0;
+    v.mair0=(unsigned)((c->lower?c->lower_tables->mair:0)|(c->upper?c->upper_tables->mair:0));v.mair1=0;
     v.sctlr=0x1067|(c->stall_on_fault<<7)|(c->continue_after_fault<<8);
     if(c->polled_faults)v.sctlr&=~UINT32_C(0x40); /* CFRE stays on; CFIE off. */
     if(c->shared_asid)v.sctlr&=~UINT32_C(0x1000);
@@ -80,10 +81,16 @@ ArmSmmu4KStatus ArmSmmu4KValidateContextReadback(const ArmSmmu4KContextConfig *c
      * ASIDPNE. No broad mask or automatic acceptance of a different root,
      * granule, stage, address width, cache mode or fault policy.
      */
+    /* A disabled upper region retains the kernel's unused TTBR1 value while
+     * TTBR0 changes ASID. Admit it only together with the board's ownership
+     * proof of both lower roots and that exact unused hardware register. */
+    const int owned_lower=!c->upper && ArmSmmu4KAdmitOwnedRoot &&
+        ArmSmmu4KAdmitOwnedRoot(expected.ttbr0,observed->ttbr0,observed->ttbr1);
     if(expected.cbar!=observed->cbar || expected.cba2r!=observed->cba2r ||
         expected.tcr!=observed->tcr || expected.tcr2!=observed->tcr2 ||
         expected.mair0!=observed->mair0 || expected.mair1!=observed->mair1 ||
-        expected.sctlr!=observed->sctlr || observed->reserved_zero || expected.ttbr0!=observed->ttbr0 ||
-        expected.ttbr1!=observed->ttbr1)return ArmSmmu4KStateMismatch;
+        expected.sctlr!=observed->sctlr || observed->reserved_zero ||
+        (expected.ttbr0!=observed->ttbr0 && !owned_lower) ||
+        (expected.ttbr1!=observed->ttbr1 && !owned_lower))return ArmSmmu4KStateMismatch;
     return ArmSmmu4KSuccess;
 }

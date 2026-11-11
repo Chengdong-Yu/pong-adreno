@@ -264,6 +264,22 @@ IOReturn NativeAdrenoRing::submitFramed(const uint32_t *words,size_t word_count,
 {
     return submitWords(words,word_count,fence,true);
 }
+IOReturn NativeAdrenoRing::submitTableDrain(uint32_t *fence)
+{
+    // A fence alone proves execution, not that address-tagged LRZ/UCHE
+    // writeback has finished in the OLD address space. Drain there before
+    // a CPU switch; flushing only in the next client's prologue is too late.
+    uint32_t words[16]={};
+    const uint32_t both=RingSyncThreads|RingThreadBoth,br=RingSyncThreads|RingThreadBr,
+        lrz=RingLrzFlushInvalidate,flush=RingCacheFlush7,invalidate=RingCacheInvalidate7;
+    size_t n=packet(words,0,RingThreadControl,&both,1);
+    if(n)n=packet(words,n,RingFenceOpcode,&lrz,1);
+    if(n)n=packet(words,n,RingThreadControl,&br,1);
+    if(n)n=packet(words,n,RingFenceOpcode,&flush,1);
+    if(n)n=packet(words,n,RingFenceOpcode,&invalidate,1);
+    if(n)n=packet(words,n,RingWaitForIdle,nullptr,0);
+    return n?submitWords(words,n,fence,false):kIOReturnIOError;
+}
 IOReturn NativeAdrenoRing::submitWords(const uint32_t *words,size_t word_count,uint32_t *fence,bool framed)
 {
     if(!fence)return kIOReturnBadArgument;*fence=0;

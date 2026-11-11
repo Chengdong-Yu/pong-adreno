@@ -103,24 +103,29 @@ IOReturn NativeAdrenoVm::attach(const ArmSmmu4KIo *io,ArmSmmu4KContextConfig *co
     size_t capacity,unsigned budget)
 {
     if(attached_ || ranges_ || poisoned_)return kIOReturnBusy;
-    if(!io || !context || !streams || (!lower && !upper) || !capacity || capacity>262144 ||
+    if(!io || !context || !streams || (!lower && !upper) || !capacity || capacity>1048576 ||
         !budget || budget>1048576 || (lower && !validBinding(*lower,0)) || (upper && !validBinding(*upper,1)))
         return kIOReturnBadArgument;
-    capacity_=capacity;
-    ranges_=IONewData(ArmSmmu4KRange,capacity);
+    // Match upstream's demand-grown transaction scratch: a newly opened
+    // process must not wire 32MiB just to reserve its full GPU aperture.
+    capacity_limit_=capacity;capacity_=capacity<1024?capacity:1024;
+    ranges_=IONewData(ArmSmmu4KRange,capacity_);
+    alias_scratch_=IONewData(uint32_t,capacity_);
     mappings_=IONewData(Mapping,NativeAdrenoVmMaxObjects);
     order_=IONewData(uint32_t,NativeAdrenoVmMaxObjects);
-    if(!ranges_ || !mappings_ || !order_ || !index_.allocate()) {freeMetadata();return kIOReturnNoMemory;}
+    if(!ranges_ || !alias_scratch_ || !mappings_ || !order_ || !index_.allocate()) {freeMetadata();return kIOReturnNoMemory;}
     memset(mappings_,0,sizeof(Mapping)*NativeAdrenoVmMaxObjects);
     free_hint_=0;high_=0;memset(class_spans_,0,sizeof(class_spans_));
     order_count_[0]=order_count_[1]=0;
-    capacity_=capacity;io_=*io;context_=context;streams_=streams;budget_=budget;
+    io_=*io;context_=context;streams_=streams;budget_=budget;
     if(lower)regions_[0]=*lower;if(upper)regions_[1]=*upper;
     for(unsigned i=0;i<2;++i)if(regions_[i].arena) {
         if(NativeAdrenoBindSmmuVisibility(regions_[i].tables,&visibility_[i])!=kIOReturnSuccess) {
             freeMetadata();
             regions_[0]={};regions_[1]={};return kIOReturnBadArgument;
         }
+        regions_[i].arena->alias_scratch=alias_scratch_;
+        regions_[i].arena->alias_scratch_entries=capacity_;
     }
     attached_=true;
     ArmSmmu4KStatus status=observe();if(status)return fail(status);
@@ -136,10 +141,30 @@ IOReturn NativeAdrenoVm::detach()
 }
 void NativeAdrenoVm::freeMetadata()
 {
+    for(auto &r:regions_)if(r.arena && r.arena->alias_scratch==alias_scratch_) {
+        r.arena->alias_scratch=nullptr;r.arena->alias_scratch_entries=0;
+    }
     if(ranges_)IODeleteData(ranges_,ArmSmmu4KRange,capacity_);
+    if(alias_scratch_)IODeleteData(alias_scratch_,uint32_t,capacity_);
     if(mappings_)IODeleteData(mappings_,Mapping,NativeAdrenoVmMaxObjects);
     if(order_)IODeleteData(order_,uint32_t,NativeAdrenoVmMaxObjects);
-    index_.release();ranges_=nullptr;mappings_=nullptr;order_=nullptr;capacity_=0;
+    index_.release();ranges_=nullptr;alias_scratch_=nullptr;mappings_=nullptr;order_=nullptr;capacity_=capacity_limit_=0;
+}
+bool NativeAdrenoVm::growScratch(size_t needed)
+{
+    if(needed<=capacity_)return true;
+    if(needed>capacity_limit_)return false;
+    size_t size=capacity_>capacity_limit_/2?capacity_limit_:capacity_*2;
+    if(size<needed)size=needed;
+    auto *ranges=IONewData(ArmSmmu4KRange,size);
+    if(!ranges)return false;
+    auto *scratch=IONewData(uint32_t,size);
+    if(!scratch){IODeleteData(ranges,ArmSmmu4KRange,size);return false;}
+    IODeleteData(ranges_,ArmSmmu4KRange,capacity_);
+    IODeleteData(alias_scratch_,uint32_t,capacity_);
+    ranges_=ranges;alias_scratch_=scratch;capacity_=size;
+    for(auto &r:regions_)if(r.arena){r.arena->alias_scratch=scratch;r.arena->alias_scratch_entries=size;}
+    return true;
 }
 IOReturn NativeAdrenoVm::findAddress(unsigned upper,size_t bytes,uint64_t alignment,uint64_t *out) const
 {
@@ -273,6 +298,7 @@ IOReturn NativeAdrenoVm::map(NativeAdrenoMemory *memory,unsigned upper,uint64_t 
 {
     if(!handle)return kIOReturnBadArgument;*handle=0;result_={};
     if(!attached_ || poisoned_)return kIOReturnNotReady;
+    if(memory && !growScratch(memory->spanCount()))return kIOReturnNoMemory;
     PhaseClock clock;
     const unsigned cls=aliasClass(permissions,writeback,shareability)&15;
     const bool exclusive=exclusivePages(memory,cls);

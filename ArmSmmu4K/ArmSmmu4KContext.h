@@ -24,6 +24,10 @@ typedef struct {
     uint32_t cbar, cba2r, tcr, tcr2, mair0, mair1, sctlr, reserved_zero;
     uint64_t ttbr0, ttbr1;
 } ArmSmmu4KContextImage;
+/* Optional board proof for its explicitly leased process tables. Both roots
+ * must be retained by that board; NULL keeps the normal exact-root check.
+ * Kept outside ContextConfig so WiFi/audio/GMU retain their existing ABI. */
+extern int (*ArmSmmu4KAdmitOwnedRoot)(uint64_t expected,uint64_t observed,uint64_t unused_ttbr1);
 
 /* Encode AArch64 stage1, stage2-bypass native4K SMMUv2 context registers.
  * Capability/width/result/refusal checks precede publishing an image. Failure

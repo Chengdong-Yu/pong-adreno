@@ -63,13 +63,15 @@ class NativeAdrenoVm final {
     uint32_t *order_=nullptr;
     size_t order_count_[2]{};
     ArmSmmu4KRange *ranges_=nullptr;
-    size_t capacity_=0,lower_count_=0,upper_count_=0,objects_=0;
+    uint32_t *alias_scratch_=nullptr;
+    size_t capacity_=0,capacity_limit_=0,lower_count_=0,upper_count_=0,objects_=0;
     unsigned budget_=0;
     uint64_t next_handle_=1;
     bool attached_=false,poisoned_=false,distrust_write_combined_=false;
     NativeAdrenoVmResult result_{};
     ArmSmmu4KLiveRegion region(unsigned,const ArmSmmu4KRange *ranges=nullptr,size_t count=0) const;
     void freeMetadata();
+    bool growScratch(size_t);
     ArmSmmu4KStatus observe() const;
     /* The route check alone: the table walk is the update's own (it verifies every region before the first store and after the last), so
      * map/unmap pay a full extra audit only every 64th operation (int-139: 4 full walks of the 2 GiB aperture made every map 70 ms). */
