@@ -401,7 +401,7 @@ IOReturn NativeAdrenoVm::invalidateTlb()
     const ArmSmmu4KStatus status=ArmSmmu4KSynchronizeOwnedContext(&io_,streams_->bank,context_,budget_,&r);
     return status?fail(status):kIOReturnSuccess;
 }
-IOReturn NativeAdrenoVm::publishMapped(uint64_t window_start,uint64_t window_bytes)
+IOReturn NativeAdrenoVm::publishMapped(uint64_t window_start,uint64_t window_bytes,NativeAdrenoCacheWork *work)
 {
     if(!attached_ || poisoned_)return kIOReturnNotReady;
     if(window_bytes && window_start>UINT64_MAX-window_bytes)return kIOReturnBadArgument;
@@ -411,11 +411,14 @@ IOReturn NativeAdrenoVm::publishMapped(uint64_t window_start,uint64_t window_byt
         if(window_bytes && (m.upper || m.iova>=window_start+window_bytes))break;
         if(!m.memory || !inWindow(m.iova,m.memory->bytes(),window_start,window_bytes))continue;
         if(coherentMapping(m.writeback) || importedUntouched(m.memory) || m.memory->explicitSync()) {native_adreno_coherent_skips[2]=native_adreno_coherent_skips[2]+1;continue;}
-        if(m.memory->publishForDevice(0,m.memory->bytes(),true,distrust_write_combined_))return fail(ArmSmmu4KIoError);
+        const uint64_t prior=work?work->bytes:0;
+        if(m.memory->publishForDevice(0,m.memory->bytes(),true,distrust_write_combined_,work))return fail(ArmSmmu4KIoError);
+        if(work && work->bytes!=prior)work->noteMapping(prior,m.iova,m.permissions |
+            (m.memory->imported()?0x100u:0u) | (m.memory->writeCombined()?0x200u:0u));
     }
     return kIOReturnSuccess;
 }
-IOReturn NativeAdrenoVm::acquireImported(uint64_t window_start,uint64_t window_bytes)
+IOReturn NativeAdrenoVm::acquireImported(uint64_t window_start,uint64_t window_bytes,NativeAdrenoCacheWork *work)
 {
     if(!attached_ || poisoned_)return kIOReturnNotReady;
     if(window_bytes && window_start>UINT64_MAX-window_bytes)return kIOReturnBadArgument;
@@ -426,7 +429,10 @@ IOReturn NativeAdrenoVm::acquireImported(uint64_t window_start,uint64_t window_b
         if(!m.memory || !m.memory->imported() || !(m.permissions&ArmSmmu4KWrite) ||
             !inWindow(m.iova,m.memory->bytes(),window_start,window_bytes))continue;
         if(coherentMapping(m.writeback) || importedUntouched(m.memory) || m.memory->explicitAcquire()) {native_adreno_coherent_skips[3]=native_adreno_coherent_skips[3]+1;continue;}
-        if(m.memory->acquireDeviceWrites(0,m.memory->bytes()))return fail(ArmSmmu4KIoError);
+        const uint64_t prior=work?work->bytes:0;
+        if(m.memory->acquireDeviceWrites(0,m.memory->bytes(),work))return fail(ArmSmmu4KIoError);
+        if(work && work->bytes!=prior)work->noteMapping(prior,m.iova,m.permissions |
+            (m.memory->imported()?0x100u:0u) | (m.memory->writeCombined()?0x200u:0u));
     }
     return kIOReturnSuccess;
 }

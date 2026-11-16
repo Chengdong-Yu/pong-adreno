@@ -109,7 +109,7 @@ public:
     /* Cleans and invalidates the CPU caches over every mapped BO (whole objects; imported ones through their physical pages), so
      * no CPU cache line can hold data the GPU should see or hide what it wrote. Lines are physically tagged, so this also reaches
      * lines a user mapping of the same pages left behind. int-070 runs it before every submission. */
-    IOReturn publishMapped(uint64_t window_start=0,uint64_t window_bytes=0);
+    IOReturn publishMapped(uint64_t window_start=0,uint64_t window_bytes=0,NativeAdrenoCacheWork *work=nullptr);
     /* The submit path saw a CPU-cached word that DRAM did not hold yet in a client's BO: from now on write-combined BOs are maintained
      * like any other (sticky; the safe behaviour of int-070..097). */
     void distrustWriteCombined() {distrust_write_combined_=true;}
@@ -117,7 +117,7 @@ public:
     /* After a submission completed: cleans and invalidates the CPU caches over every GPU-writable imported BO, so the owner's mapping
      * (an IOSurface) reads what the GPU wrote, not a line prefetched while the GPU ran. Jobs name only their IBs, so every such BO
      * is covered. int-071: an imported render target read back 672 of 4096 texels stale. */
-    IOReturn acquireImported(uint64_t window_start=0,uint64_t window_bytes=0);
+    IOReturn acquireImported(uint64_t window_start=0,uint64_t window_bytes=0,NativeAdrenoCacheWork *work=nullptr);
     /* Diagnostic, never a proof of coherence: the 32-bit word at a mapped GPU address as the kernel's cacheable alias reads it
      * and, when the board installed native_adreno_dram_read32, as DRAM reads it through an uncached mapping (else ~0). */
     IOReturn sampleWord(uint64_t iova,uint32_t *cached,uint32_t *dram) const;

@@ -13,22 +13,30 @@ template<class Range> class NativeAdrenoPhysicalIndex final {
     uint32_t *order_;
     size_t count_;
     uint64_t end(uint32_t i) const {return ranges_[i].physical+ranges_[i].bytes;}
-    bool less(uint32_t a,uint32_t b) const {
-        return ranges_[a].physical<ranges_[b].physical ||
-            (ranges_[a].physical==ranges_[b].physical && ranges_[a].bytes<ranges_[b].bytes);
+    static bool less(const Range *ranges,uint32_t a,uint32_t b) {
+        return ranges[a].physical<ranges[b].physical ||
+            (ranges[a].physical==ranges[b].physical && ranges[a].bytes<ranges[b].bytes);
     }
-    void sift(size_t root,size_t count) {
+    static void sift(const Range *ranges,uint32_t *order,size_t root,size_t count) {
         while(root<count/2) {
             size_t child=root*2+1;
-            if(child+1<count && less(order_[child],order_[child+1]))++child;
-            if(!less(order_[root],order_[child]))break;
-            uint32_t t=order_[root];order_[root]=order_[child];order_[child]=t;root=child;
+            if(child+1<count && less(ranges,order[child],order[child+1]))++child;
+            if(!less(ranges,order[root],order[child]))break;
+            uint32_t t=order[root];order[root]=order[child];order[child]=t;root=child;
         }
     }
 public:
+    /* Iterative sort, keeping every interval for callers that check overlap. */
+    static void sort(const Range *ranges,uint32_t *order,size_t count) {
+        for(size_t i=count/2;i-->0;)sift(ranges,order,i,count);
+        for(size_t n=count;n>1;) {
+            --n;
+            uint32_t t=order[0];order[0]=order[n];order[n]=t;
+            sift(ranges,order,0,n);
+        }
+    }
     NativeAdrenoPhysicalIndex(const Range *ranges,uint32_t *order,size_t count):ranges_(ranges),order_(order),count_(count) {
-        for(size_t i=count/2;i-->0;)sift(i,count);
-        for(size_t n=count;n>1;) {--n;uint32_t t=order_[0];order_[0]=order_[n];order_[n]=t;sift(0,n);}
+        sort(ranges,order,count);
         /* Discard an interval contained by an earlier interval. The remaining
          * starts AND ends are monotonic, even for nested/duplicate/overlapping
          * inputs. Each query then needs a binary search, with no backward scan. */

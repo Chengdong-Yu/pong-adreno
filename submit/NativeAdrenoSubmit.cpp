@@ -7,6 +7,7 @@
 #include <IOKit/IOLib.h>
 #include <kern/clock.h>
 extern "C" uint64_t (*native_adreno_gpu_ticks)(void);
+extern "C" uint64_t pong_adreno_first_fence_irq_us(uint64_t from,uint64_t through);
 extern "C" uint64_t (*native_adreno_vm_now_us)(void);
 extern "C" volatile uint64_t native_adreno_explicit_sync_stats[3];
 extern "C" volatile uint64_t native_adreno_cache_batches[3];
@@ -51,10 +52,51 @@ IOReturn NativeAdrenoSubmit::attach(NativeAdrenoVm *vm,NativeAdrenoRing *ring)
     if(attached_ || poisoned_ || vm_ || ring_)return kIOReturnBusy;
     if(!vm || !ring || vm->poisoned() || ring->poisoned())return kIOReturnBadArgument;
     vm_=vm;ring_=ring;attached_=true;stats_={};current_context_=UINT32_MAX;
+    for(auto &timing:client_timing_)timing={};
     return kIOReturnSuccess;
 }
-IOReturn NativeAdrenoSubmit::release(Job &job)
+NativeAdrenoSubmit::ClientTiming *NativeAdrenoSubmit::clientTiming(uint32_t context,int32_t pid)
 {
+    if(context>=sizeof(client_timing_)/sizeof(client_timing_[0]))return nullptr;
+    ClientTiming &timing=client_timing_[context];
+    if(timing.pid!=pid){timing={};timing.pid=pid;}
+    return &timing;
+}
+void NativeAdrenoSubmit::reportClientTiming()
+{
+    for(unsigned slot=0;slot<sizeof(client_timing_)/sizeof(client_timing_[0]);++slot) {
+        ClientTiming &t=client_timing_[slot];
+        if(!t.publish.calls && !t.acquire.calls && !t.execute.calls && !t.missing_stamps)continue;
+        IOLog("[gpu phase] slot=%u pid=%d publish calls=%u maps=%u bytes=%llu total_us=%llu max_us=%llu "
+            "acquire calls=%u maps=%u bytes=%llu total_us=%llu max_us=%llu "
+            "hw=%u missing=%u queue_total_us=%llu queue_max_us=%llu gpu_total_us=%llu gpu_max_us=%llu\n",
+            slot,t.pid,t.publish.calls,t.publish.mappings,t.publish.bytes,t.publish.total_us,t.publish.max_us,
+            t.acquire.calls,t.acquire.mappings,t.acquire.bytes,t.acquire.total_us,t.acquire.max_us,
+            t.execute.calls,t.missing_stamps,t.queue.total_us,t.queue.max_us,t.execute.total_us,t.execute.max_us);
+        if(t.publish.largest_bytes || t.acquire.largest_bytes) {
+            IOLog("[gpu cache scope] slot=%u pid=%d publish_bytes=%llu publish_iova=%#llx publish_flags=%#x "
+                "acquire_bytes=%llu acquire_iova=%#llx acquire_flags=%#x\n",
+                slot,t.pid,t.publish.largest_bytes,t.publish.largest_iova,t.publish.largest_flags,
+                t.acquire.largest_bytes,t.acquire.largest_iova,t.acquire.largest_flags);
+        }
+        const PhaseTiming *phases[]={&t.publish,&t.acquire};
+        for(unsigned phase=0;phase<2;++phase) {
+            const auto &sample=phases[phase]->sample;
+            if(!sample.count)continue;
+            IOLog("[gpu cache sample] slot=%u pid=%d phase=%s maps=%u bytes=%llu large=%u\n",
+                slot,t.pid,phase?"acquire":"publish",sample.mappings,sample.bytes,sample.count);
+            for(unsigned i=0;i<sample.count && i<sizeof(sample.large)/sizeof(sample.large[0]);++i) {
+                const auto &mapping=sample.large[i];
+                IOLog("[gpu cache map] slot=%u pid=%d phase=%s index=%u iova=%#llx bytes=%llu flags=%#x\n",
+                    slot,t.pid,phase?"acquire":"publish",i,mapping.iova,mapping.bytes,mapping.flags);
+            }
+        }
+        t={};
+    }
+}
+IOReturn NativeAdrenoSubmit::release(Job &job,const char *origin)
+{
+    const uint64_t observed_us=native_adreno_vm_now_us?native_adreno_vm_now_us():0;
     IOReturn status=kIOReturnSuccess;
     for(size_t i=0;i<job.count;++i) {
         IOReturn retired=vm_->retireJobAfterCompletion(job.handles[i]);
@@ -68,35 +110,53 @@ IOReturn NativeAdrenoSubmit::release(Job &job)
     // Any new submit invalidates this record, as does a changed completion
     // or VA lease. Real fence observation/BO reference retirement stay per job.
     const unsigned context=job.queue/NativeAdrenoAbiMaxQueues;
+    ClientTiming *timing=clientTiming(context,job.pid);
     const uint32_t completed=ring_->completedFence();
     AcquiredWindow *acquired=context<16?&acquired_[context]:nullptr;
-    if(!acquired || !acquired->valid || acquired->completed!=completed ||
-       acquired->start!=job.window_start || acquired->bytes!=job.window_bytes) {
-        if(vm_->acquireImported(job.window_start,job.window_bytes))return poison();
+    const bool walk=!acquired || !acquired->valid || acquired->completed!=completed ||
+        acquired->start!=job.window_start || acquired->bytes!=job.window_bytes;
+    NativeAdrenoCacheWork work{};
+    if(context==0 && timing && timing->acquire.calls==511)work.sample=&timing->acquire.sample;
+    if(walk) {
+        if(vm_->acquireImported(job.window_start,job.window_bytes,timing?&work:nullptr))return poison();
         native_adreno_acquire_batches[0]++;
         if(acquired)*acquired={job.window_start,job.window_bytes,completed,true};
     } else native_adreno_acquire_batches[1]++;
     const uint64_t now=native_adreno_vm_now_us?native_adreno_vm_now_us():0;
     const uint64_t acquire_us=now>=acquire_began?now-acquire_began:0;
     uint64_t start=0,end=0;
+    const bool stamps=ring_->timeline(job.fence,&start,&end);
+    // Reject old/missing CP stamps rather than substituting a CPU duration.
+    const bool timed=stamps && job.submit_tick && start>=job.submit_tick && end>start;
+    const uint64_t queue=timed?(start-job.submit_tick)*10/192:0;
+    const uint64_t execute=timed?(end-start)*10/192:0;
+    if(timing) {
+        if(walk)timing->acquire.add(acquire_us,work);
+        if(timed){timing->queue.add(queue);timing->execute.add(execute);}
+        else ++timing->missing_stamps;
+    }
     if(job.submit_us && now>=job.submit_us && now-job.submit_us>=33000) {
         if(now-slow_window_>=1000000){slow_window_=now;slow_logged_=0;}
         if(slow_logged_<8) {
             ++slow_logged_;
-            const bool stamps=ring_->timeline(job.fence,&start,&end);
             const uint64_t tick=native_adreno_gpu_ticks?native_adreno_gpu_ticks():0;
-            // The A730 CP counter is19.2MHz. Zero means unavailable;
-            // never substitute CPU elapsed time for a GPU execution stamp.
-            const uint64_t queue=stamps && start>=job.submit_tick && job.submit_tick?(start-job.submit_tick)*10/192:0;
-            const uint64_t execute=stamps?(end-start)*10/192:0;
-            const uint64_t retire=stamps && tick>=end?(tick-end)*10/192:0;
+            const uint64_t retire=timed && tick>=end?(tick-end)*10/192:0;
             IOLog("[gpu slow] pid=%d role=%d priority=%d fence=%u prior_pid=%d total_us=%llu cpu_sync_us=%llu acquire_us=%llu queue_us=%llu gpu_us=%llu retire_us=%llu stamps=%u rptr=%u admitted_yields=%llu\n",
                 job.pid,job.role,job.priority,job.fence,job.preceding_pid,(unsigned long long)(now-job.submit_us),
                 (unsigned long long)job.sync_us,(unsigned long long)acquire_us,(unsigned long long)queue,(unsigned long long)execute,(unsigned long long)retire,
-                stamps?1:0,ring_->readPointer(),(unsigned long long)admission_yields_);
+                timed?1:0,ring_->readPointer(),(unsigned long long)admission_yields_);
+            // GPU and host clocks have distinct epochs. Translate the CP end
+            // using the sampled GPU-to-host elapsed time, and match only an
+            // IRQ timestamp bounded by CP end and authoritative observation.
+            const uint64_t paired_us=native_adreno_vm_now_us?native_adreno_vm_now_us():0;
+            const uint64_t cp_end_us=retire && paired_us>=retire?paired_us-retire:0;
+            const uint64_t irq_us=pong_adreno_first_fence_irq_us(cp_end_us,observed_us);
+            IOLog("[gpu retire detail] fence=%u via=%s handles=%zu cp_end_us=%llu first_irq_us=%llu observed_us=%llu refs_us=%llu acquire_us=%llu\n",
+                job.fence,origin,job.count,(unsigned long long)cp_end_us,(unsigned long long)irq_us,
+                (unsigned long long)observed_us,
+                (unsigned long long)(acquire_began-observed_us),(unsigned long long)acquire_us);
         }
     }
-    (void)ring_->timeline(job.fence,&start,&end);
     gpuTraceEvent(GpuTraceRetire,job.pid,job.fence,job.queue,0,job.submit_us,start,end,end>start,0);
     job={};return kIOReturnSuccess;
 }
@@ -220,7 +280,16 @@ IOReturn NativeAdrenoSubmit::submit(const NativeAdrenoSubmitBuffer *buffers,size
     /* Only this client's IOVA window can be referenced by its validated
      * command buffers. Maintaining every other process's IOSurfaces here
      * was both expensive and outside this submission's ownership handoff. */
-    IOReturn status=vm_->publishMapped(window_start,window_bytes);
+    ClientTiming *timing=clientTiming(cache_context,next_pid_);
+    NativeAdrenoCacheWork work{};
+    // One exact cache-maintenance set per phase in each compositor timing window.
+    if(cache_context==0 && timing && timing->publish.calls==511)work.sample=&timing->publish.sample;
+    const uint64_t publish_began=timing && native_adreno_vm_now_us?native_adreno_vm_now_us():0;
+    IOReturn status=vm_->publishMapped(window_start,window_bytes,timing?&work:nullptr);
+    if(!status && timing) {
+        const uint64_t now=native_adreno_vm_now_us?native_adreno_vm_now_us():0;
+        timing->publish.add(now>=publish_began?now-publish_began:0,work);
+    }
     if(!status && sample) {
         (void)vm_->sampleWord(buffers[0].iova,&ignored,&after);
         native_adreno_coherence[0]=native_adreno_coherence[0]+1;
@@ -283,6 +352,7 @@ IOReturn NativeAdrenoSubmit::submit(const NativeAdrenoSubmitBuffer *buffers,size
     gpuTraceEvent(GpuTraceSubmit,job->pid,value,queue,0,job->priority,job->role,0,stats_.peak_jobs,context,job->submit_us,handle_count);
     ++stats_.submissions;
     if(!(stats_.submissions&1023u)) {
+        reportClientTiming();
         IOLog("[gpu host sync] calls=%llu MiB=%llu total_us=%llu completion-acquire=active-opt-in\n",
             (unsigned long long)native_adreno_explicit_sync_stats[0],(unsigned long long)(native_adreno_explicit_sync_stats[1]>>20),
             (unsigned long long)native_adreno_explicit_sync_stats[2]);
@@ -350,7 +420,7 @@ IOReturn NativeAdrenoSubmit::wait(uint32_t fence,const NativeAdrenoRingClock *cl
         native_adreno_fence_wait[4]=ring_->lastSubmitted();native_adreno_fence_wait[5]=ring_->completedFence();
         return kIOReturnTimeout;
     }
-    IOReturn status=release(*job);
+    IOReturn status=release(*job,"wait");
     if(status)return status;
     ++stats_.completed;
     return kIOReturnSuccess;
@@ -382,10 +452,13 @@ IOReturn NativeAdrenoSubmit::retireCompleted()
     if(!attached_ || poisoned_)return kIOReturnNotReady;
     for(auto &job:jobs_) {
         if(!job.active)continue;
-        const NativeAdrenoRingFence state=ring_->observeFence(job.fence,nullptr,0,nullptr);
+        // The acquire cache is keyed by the CP-completed value. Advance
+        // the ring's validated completion on every successful sweep, even
+        // when no client has issued a direct wait since the last acquire.
+        const NativeAdrenoRingFence state=ring_->wait(job.fence,nullptr,0,nullptr);
         if(state==NativeAdrenoRingFencePoisoned)return poison();
         if(state!=NativeAdrenoRingFenceComplete)continue;
-        const IOReturn status=release(job);
+        const IOReturn status=release(job,"sweep");
         if(status)return status;
         ++stats_.completed;
     }
