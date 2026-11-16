@@ -36,6 +36,8 @@ struct NativeAdrenoRingClock {
     uint64_t (*now_us)(void *);
     /* Optional; may sleep. Never used before a successful submit. */
     int (*idle)(void *);
+    /* Optional advisory check and pause, armed against the same IRQ generation. */
+    bool (*idle_if_fence_pending)(void *,uint32_t)=nullptr;
 };
 enum NativeAdrenoRingFence {
     NativeAdrenoRingFenceComplete = 0,

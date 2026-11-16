@@ -23,6 +23,7 @@ extern "C" volatile uint32_t native_adreno_wc_enabled;
 extern "C" volatile uint32_t native_adreno_coherence[8],native_adreno_wc_audit[6];
 extern "C" uint64_t (*native_adreno_vm_now_us)(void);
 extern "C" {uint64_t (*native_adreno_gpu_ticks)(void)=nullptr;}
+extern "C" uint64_t pong_adreno_first_fence_irq_us(uint64_t,uint64_t);
 extern "C" unsigned int pong_adreno_zap_reserved;
 extern "C" IOReturn armcpu_spi_attach(uint32_t,bool,void (*)(void *),void *,uint32_t *,uint64_t *);
 extern "C" int get_preemption_level(void);
@@ -51,6 +52,8 @@ struct Device {
     NativeAdrenoStatus status;
     NativeAdrenoIrq irq;
     uint32_t irq_fatal=0,irq_count=0,irq_cp_status=0,irq_protect_status=0;
+    // Written by the serialized GPU SPI callback, sampled only by slow jobs.
+    uint64_t fence_irqs=0,fence_irq_time_us[64]{};
     PongCpBackend backend{};
     OSSharedPtr<IOMemoryMap> zap_map;
     PongZapState zap{};
@@ -62,21 +65,32 @@ Device *gpu;
 static uint64_t now(void *) {uint64_t ns=0;absolutetime_to_nanoseconds(mach_absolute_time(),&ns);return ns/1000;}
 static uint64_t vm_now() {return now(nullptr);}
 /* Sheng's IRQ-driven wait avoids a 1ms sleep on every GPU completion. */
-static int idle(void *)
+static void idleAfterIrqSnapshot(uint32_t before)
 {
     if(gpu->irq_attached && ml_get_interrupts_enabled() && !ml_at_interrupt_context() && !get_preemption_level()) {
         /* The fence IRQ wakes this immediately. A 100 us timeout generated
          * thousands of scheduler wakeups while a wallpaper pass ran; retain
          * a bounded 1 ms fallback for a missed/early interrupt. */
-        const uint32_t before=__atomic_load_n(&gpu->irq_count,__ATOMIC_ACQUIRE);
         assert_wait_timeout(event_t(&gpu->irq_count),THREAD_UNINT,1,NSEC_PER_MSEC);
-        // Close the IRQ-before-sleep window: a completion that arrived while
-        // establishing the wait must not pay the whole fallback millisecond.
         if(__atomic_load_n(&gpu->irq_count,__ATOMIC_ACQUIRE)!=before)
             thread_wakeup(event_t(&gpu->irq_count));
         thread_block(THREAD_CONTINUE_NULL);
     } else IODelay(20);
+}
+static int idle(void *)
+{
+    idleAfterIrqSnapshot(__atomic_load_n(&gpu->irq_count,__ATOMIC_ACQUIRE));
     return 0;
+}
+static bool idleIfFencePending(void *,uint32_t fence)
+{
+    /* Sample before the advisory fence read. If completion is signalled
+     * after that read but before wait registration, the IRQ generation
+     * still cancels this sleep. Completion stays under the device gate. */
+    const uint32_t before=__atomic_load_n(&gpu->irq_count,__ATOMIC_ACQUIRE);
+    if(!gpu->ring.fencePending(fence))return false;
+    idleAfterIrqSnapshot(before);
+    return true;
 }
 static void note(const char *phase,unsigned result,uint64_t a=0,uint64_t b=0)
 {gpu->ops.record(phase,result,a,b);}
@@ -149,6 +163,11 @@ static void interrupt(void *)
 {
     NativeAdrenoIrqResult result={};
     const IOReturn status=gpu->irq.handle(&result);
+    if(result.flags&NativeAdrenoIrqFence) {
+        const uint64_t index=__atomic_load_n(&gpu->fence_irqs,__ATOMIC_RELAXED);
+        __atomic_store_n(&gpu->fence_irq_time_us[index%64],now(nullptr),__ATOMIC_RELAXED);
+        __atomic_store_n(&gpu->fence_irqs,index+1,__ATOMIC_RELEASE);
+    }
     __atomic_fetch_add(&gpu->irq_count,1,__ATOMIC_RELAXED);
     thread_wakeup(event_t(&gpu->irq_count));
     if(status || (result.flags&NativeAdrenoIrqFatal)) {
@@ -461,9 +480,22 @@ IOReturn PongAdrenoCpStart(PongGpuGmuDevice *gmu)
     gpu->ring.setTimeline(timeline!=0);
     native_adreno_gpu_ticks=[]()->uint64_t{uint64_t value=0;if(gpu && !gpu->poisoned)(void)gpu->timer.read(&value);return value;};
     gpu->started=true;native_adreno_wc_enabled=1;
-    gpu->backend={&gpu->vm,&gpu->submit,&gpu->ring,&gpu->timer,&gpu->status,{nullptr,now,idle},
+    gpu->backend={&gpu->vm,&gpu->submit,&gpu->ring,&gpu->timer,&gpu->status,{nullptr,now,idle,idleIfFencePending},
         {PongAdrenoChipId,PongAdrenoGmemBytes,0,0x1fffffffff000ULL,0x20000000,0xA0000000,
          PongAdrenoHighestBankBit,6,1,4,NativeAdrenoDeviceClientIova,0},gpu->output_bits,client_healthy};
     note("CP ready; authenticated nonsecure fence",0,fence,ticks);
     return PongAdrenoPublishClient(&gpu->backend)?kIOReturnSuccess:kIOReturnNoResources;
+}
+
+extern "C" uint64_t pong_adreno_first_fence_irq_us(uint64_t from,uint64_t through)
+{
+    if(!gpu || !from || through<from)return 0;
+    const uint64_t upper=__atomic_load_n(&gpu->fence_irqs,__ATOMIC_ACQUIRE);
+    const uint64_t lower=upper>64?upper-64:0;
+    uint64_t first=0;
+    for(uint64_t i=lower;i<upper;++i) {
+        const uint64_t time=__atomic_load_n(&gpu->fence_irq_time_us[i%64],__ATOMIC_RELAXED);
+        if(time>=from && time<=through && (!first || time<first))first=time;
+    }
+    return first;
 }

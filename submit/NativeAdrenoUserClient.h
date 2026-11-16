@@ -27,6 +27,7 @@ class NativeAdrenoUserClient final {
         uint64_t host_address=0;
         bool used=false;
         bool mapped_state=false;
+        bool gpu_map_attempted=false;
         bool unreleasable=false;
         bool imported=false;
         uint32_t imported_pid=0;
@@ -91,6 +92,9 @@ public:
     uint64_t windowPeak() const {return window_peak_;}
     /* Whether any job is unobserved in the range this client owns (never, while it owns none). */
     bool ownRangeOutstanding() const;
+    // With the device gate held, only a private, never-mapped system BO
+    // can bypass the client-wide drain.
+    bool canFreeUnmappedSystemBo(uint64_t handle);
     /* Refuses while any object is live or any of this client's jobs is unobserved. */
     IOReturn close();
     /* Connection teardown: waits for every outstanding job, then unmaps and frees every object, closes every queue and
@@ -112,7 +116,8 @@ public:
     IOReturn mapBo(const NativeAdrenoAbiBoMap *,NativeAdrenoAbiBoMapReply *);
     /* BoImport: pins the caller's pages. Only the IOKit wrapper can call it, with the calling task; dispatch() refuses the method
      * because it has no task (the kernel mailbox path cannot import). */
-    IOReturn importBo(const NativeAdrenoAbiBoImport *,void *task,NativeAdrenoAbiBoAllocReply *);
+    IOReturn importBo(const NativeAdrenoAbiBoImport *,void *task,NativeAdrenoAbiBoAllocReply *,
+        NativeAdrenoTaskPages *prepared=nullptr,IOReturn preparation=kIOReturnSuccess);
     /* Unmaps if still mapped, then releases the backing object. A failure at
      * either step keeps the entry live and unmapped where possible. */
     IOReturn freeBo(const NativeAdrenoAbiBoFree *);

@@ -149,7 +149,12 @@ extern "C" IOReturn pong_scanout_call(task_t owner,unsigned op,const void *in,si
     uint64_t ms=static_cast<const PongScanoutWaitInfo *>(in)->timeout_ms;
     const uint64_t until=deadline(unsigned(ms>1000?1000:ms));waiting=true;workerReady=true;
     while(client==owner && !poisoned && !idleNotify && (!pending.offered || pending.delivered)) {
-        if(IOLockSleepDeadline(scanout_gate,&pending,until,THREAD_ABORTSAFE)!=THREAD_AWAKENED) {
+        const wait_result_t result = IOLockSleepDeadline(scanout_gate,&pending,until,THREAD_ABORTSAFE);
+        // An offer can arrive before a timed-out waiter reacquires the lock.
+        if(result == THREAD_TIMED_OUT && pending.offered && !pending.delivered) {
+            break;
+        }
+        if(result != THREAD_AWAKENED) {
             waiting=false;IOLockUnlock(scanout_gate);return kIOReturnTimeout;
         }
     }
@@ -177,7 +182,8 @@ extern "C" int pong_scanout_frame(IOMemoryDescriptor *source,size_t offset,uint3
     if(!scanout_gate || !source || stride<uint64_t(width)*4 || width!=mode.width || height!=mode.height || (offset&4095))return 0;
     IOLockLock(scanout_gate);
     if(poisoned){IOLockUnlock(scanout_gate);return 2;}
-    if(!client || !workerReady || pending.offered){IOLockUnlock(scanout_gate);return 0;}
+    // A registered worker can be between Wait calls. Without a live listener, use the CPU.
+    if(!client || !workerReady || !waiting || pending.offered){IOLockUnlock(scanout_gate);return 0;}
     size_t bytes=(size_t(stride)*height+4095)&~size_t(4095);
     if(offset>source->getLength() || bytes>source->getLength()-offset){IOLockUnlock(scanout_gate);return 0;}
     // Retain the compositor's bounded surface pool across frames. Mapping a

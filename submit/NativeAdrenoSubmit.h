@@ -51,13 +51,41 @@ class NativeAdrenoSubmit final {
     uint64_t admission_yields_=0;
     struct AcquiredWindow {uint64_t start=0,bytes=0;uint32_t completed=0;bool valid=false;};
     AcquiredWindow acquired_[16]{};
+    struct PhaseTiming {
+        unsigned calls=0,mappings=0;
+        unsigned long long bytes=0,total_us=0,max_us=0;
+        unsigned long long largest_bytes=0,largest_iova=0;
+        uint32_t largest_flags=0;
+        NativeAdrenoCacheWork::Sample sample{};
+        void add(uint64_t elapsed,const NativeAdrenoCacheWork &work={})
+        {
+            ++calls;mappings+=work.mappings;bytes+=work.bytes;total_us+=elapsed;
+            if(work.sample) {
+                sample.mappings=work.mappings;
+                sample.bytes=work.bytes;
+            }
+            if(elapsed>max_us)max_us=elapsed;
+            if(work.largest_bytes>largest_bytes) {
+                largest_bytes=work.largest_bytes;
+                largest_iova=work.largest_iova;
+                largest_flags=work.largest_flags;
+            }
+        }
+    };
+    struct ClientTiming {
+        int32_t pid=0;
+        unsigned missing_stamps=0;
+        PhaseTiming publish,acquire,queue,execute;
+    } client_timing_[16]{};
+    ClientTiming *clientTiming(uint32_t context,int32_t pid);
+    void reportClientTiming();
     /* Serialized by the owner; a 128-IB batch must not consume kernel stack
      * with its 1 KiB handle list and 2 KiB packet list. */
     uint64_t scratch_handles_[128]{};
     uint32_t scratch_words_[128*4]{};
     Job *find(uint32_t fence);
     Job *free();
-    IOReturn release(Job &);
+    IOReturn release(Job &,const char *origin);
     IOReturn poison();
 public:
     NativeAdrenoSubmit()=default;

@@ -6,19 +6,69 @@
 #include <stdint.h>
 class IOBufferMemoryDescriptor;
 class IOMemoryDescriptor;
-struct NativeAdrenoPhysicalSpan {uint64_t offset,physical,bytes;};
-struct NativeAdrenoSystemPages {IOBufferMemoryDescriptor *descriptor=nullptr;size_t bytes=0;};
+struct NativeAdrenoPhysicalSpan {
+    uint64_t offset,physical,bytes;
+    uintptr_t aperture=0; // Validated direct-map VA for a prepared task import.
+};
+struct NativeAdrenoSystemPages {
+    IOBufferMemoryDescriptor *descriptor=nullptr;
+    size_t bytes=0;
+    NativeAdrenoPhysicalSpan *spans=nullptr;
+    size_t span_count=0,span_capacity=0;
+};
+// Unpublished task pages. Preparation may wire and fault pages, and never
+// mutates GPU state. The caller must adopt or discard this backing once.
+struct NativeAdrenoTaskPages {
+    IOMemoryDescriptor *descriptor=nullptr;
+    NativeAdrenoPhysicalSpan *spans=nullptr;
+    size_t bytes=0,span_count=0,span_capacity=0;
+    bool read_only=false,parallel_cache=false;
+    uint32_t stage=0,persistent=0,fallback=0;
+    uint64_t fail_pa=0,fail_offset=0;
+};
 struct NativeAdrenoCpuState {
     uint64_t tcr,ttbr0,ttbr1,sctlr;
     uint64_t kernel_page_bytes,kernel_map_page_bytes;
 };
 IOReturn NativeAdrenoQueryCpu4K(NativeAdrenoCpuState *);
 enum NativeAdrenoCacheOperation {NativeAdrenoClean,NativeAdrenoCleanInvalidate,NativeAdrenoInvalidate};
+struct NativeAdrenoCacheWork {
+    struct Sample {
+        struct Mapping {
+            unsigned long long iova=0,bytes=0;
+            uint32_t flags=0;
+        } large[4]{};
+        unsigned count=0,mappings=0;
+        unsigned long long bytes=0;
+    };
+    Sample *sample=nullptr;
+    uint64_t bytes=0;
+    uint32_t mappings=0;
+    uint64_t largest_bytes=0,largest_iova=0;
+    uint32_t largest_flags=0; // R/W bits, 0x100 imported, 0x200 WC.
+
+    void noteMapping(uint64_t prior,uint64_t iova,uint32_t flags)
+    {
+        const uint64_t maintained=bytes-prior;
+        if(sample && maintained>=16u*1024u*1024u) {
+            const unsigned index=sample->count++;
+            if(index<sizeof(sample->large)/sizeof(sample->large[0]))
+                sample->large[index]={iova,maintained,flags};
+        }
+        if(maintained>largest_bytes) {
+            largest_bytes=maintained;
+            largest_iova=iova;
+            largest_flags=flags;
+        }
+    }
+};
 IOReturn NativeAdrenoMaintainOwnedPages(void *,size_t,NativeAdrenoCacheOperation);
 /* The same over whole physical pages of DRAM, through the kernel's physical aperture: data cache lines are physically tagged, so this
  * reaches lines another task's mapping left (an imported IOSurface). Apple's sys_dcache_flush is only a DSB, so user space cannot. */
 IOReturn NativeAdrenoMaintainPhysicalPages(uint64_t physical,size_t bytes,NativeAdrenoCacheOperation);
-IOReturn NativeAdrenoMaintainPhysicalSpans(const NativeAdrenoPhysicalSpan *,size_t count,size_t offset,size_t bytes,NativeAdrenoCacheOperation);
+IOReturn NativeAdrenoMaintainPhysicalSpans(const NativeAdrenoPhysicalSpan *,size_t count,size_t offset,size_t bytes,
+    NativeAdrenoCacheOperation,bool allow_parallel=false);
+bool NativeAdrenoStartParallelCacheWorker();
 /* Every CPU mapping of the spans' pages becomes write-combined (true) or takes the default cacheable attribute again (false). */
 IOReturn NativeAdrenoSetPagesCacheMode(const NativeAdrenoPhysicalSpan *,size_t count,bool write_combined);
 /* int-100 found a write-combined BO's page back at the default (cacheable) attribute with dirty IB lines: XNU's view machinery sets a page's
@@ -26,6 +76,7 @@ IOReturn NativeAdrenoSetPagesCacheMode(const NativeAdrenoPhysicalSpan *,size_t c
  * then rewrites every mapping it tracks and writes the page's cache lines back); *reset counts them. */
 IOReturn NativeAdrenoReassertWriteCombined(const NativeAdrenoPhysicalSpan *,size_t count,uint32_t *reset);
 bool NativeAdrenoPagesUncached(const NativeAdrenoPhysicalSpan *,size_t count);
+size_t NativeAdrenoPrepareImportAliases(NativeAdrenoPhysicalSpan *,size_t count);
 
 /* Native XNU backing store, not a Metal device or user ABI. No IOMMU mapper,
  * Linux fd/ioctl, hardware address, guessed PA or implicit destructor cleanup.
@@ -38,6 +89,7 @@ class NativeAdrenoMemory final {
     IOBufferMemoryDescriptor *descriptor_=nullptr;
     IOMemoryDescriptor *imported_=nullptr;
     bool read_only_=false,owner_uncached_=false,explicit_sync_=false,explicit_acquire_=false;
+    bool parallel_cache_=false;
     void *mapping_=nullptr;
     NativeAdrenoPhysicalSpan *spans_=nullptr;
     size_t bytes_=0,span_count_=0,span_capacity_=0;
@@ -85,6 +137,11 @@ public:
     /* Pins bytes at address in task (a user task's own pages) instead of allocating; prepare() wires them until release().
      * There is no kernel mapping: the owner keeps its CPU mapping and does its own cache maintenance around GPU use, so
      * publishForDevice/acquireDeviceWrites have nothing to do for this object. Spans and PA bounds are checked as for allocate. */
+    static IOReturn prepareTaskPages(void *task,uint64_t address,size_t bytes,unsigned output_bits,size_t byte_budget,
+        NativeAdrenoTaskPages *);
+    static void discardTaskPages(NativeAdrenoTaskPages *);
+    static void recordTaskPreparation(const NativeAdrenoTaskPages &); // With the resource gate held.
+    IOReturn adoptTaskPages(NativeAdrenoTaskPages *);
     IOReturn importTask(void *task,uint64_t address,size_t bytes,unsigned output_bits,size_t byte_budget);
     bool imported() const {return imported_!=nullptr;}
     bool explicitSync() const {return imported_ && explicit_sync_;}
@@ -115,8 +172,9 @@ public:
      * CPU must not dirty these pages while the device owns access. */
     /* A write-combined object is skipped unless include_write_combined: then its pages are maintained through the physical aperture,
      * for a client whose view turned out to be cacheable after all (NativeAdrenoVm::distrustWriteCombined). */
-    IOReturn publishForDevice(size_t offset,size_t bytes,bool device_writes,bool include_write_combined=false);
-    IOReturn acquireDeviceWrites(size_t offset,size_t bytes);
+    IOReturn publishForDevice(size_t offset,size_t bytes,bool device_writes,bool include_write_combined=false,
+        NativeAdrenoCacheWork *work=nullptr);
+    IOReturn acquireDeviceWrites(size_t offset,size_t bytes,NativeAdrenoCacheWork *work=nullptr);
     bool quarantined() const {return quarantined_;}
     uint32_t deviceReferences() const {return device_references_;}
     size_t bytes() const {return bytes_;}
